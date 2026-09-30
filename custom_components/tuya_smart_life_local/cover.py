@@ -44,7 +44,6 @@ async def async_setup_entry(
 class TuyaDpsCover(CoordinatorEntity[TuyaSmartLifeCoordinator], CoverEntity):
     _attr_has_entity_name = True
     _attr_should_poll = False
-    _attr_device_class = CoverDeviceClass.GARAGE
     _attr_supported_features = (
         CoverEntityFeature.OPEN | CoverEntityFeature.CLOSE | CoverEntityFeature.STOP
     )
@@ -79,6 +78,21 @@ class TuyaDpsCover(CoordinatorEntity[TuyaSmartLifeCoordinator], CoverEntity):
         return current
 
     @property
+    def device_class(self) -> CoverDeviceClass:
+        device = self.current_device
+        if device:
+            category = (device.category or device.category_code or "").lower()
+            if category in ("cl", "curtain"):
+                return CoverDeviceClass.CURTAIN
+            if category in ("bl", "blind"):
+                return CoverDeviceClass.BLIND
+            if category in ("sh", "shutter"):
+                return CoverDeviceClass.SHUTTER
+            if category in ("ckmk", "garage"):
+                return CoverDeviceClass.GARAGE
+        return CoverDeviceClass.CURTAIN
+
+    @property
     def available(self) -> bool:
         return self.runtime.local.has_local_connection(self.current_device)
 
@@ -95,14 +109,12 @@ class TuyaDpsCover(CoordinatorEntity[TuyaSmartLifeCoordinator], CoverEntity):
         return None
 
     @property
-    def is_opening(self) -> bool | None:
-        device = self.current_device
-        return bool(device and str(device.dps.get(self.dp_id) or "").lower() == "open")
+    def is_opening(self) -> bool:
+        return False
 
     @property
-    def is_closing(self) -> bool | None:
-        device = self.current_device
-        return bool(device and str(device.dps.get(self.dp_id) or "").lower() == "close")
+    def is_closing(self) -> bool:
+        return False
 
     async def async_added_to_hass(self) -> None:
         self._remove_dps_listener = self.runtime.local.async_add_dps_listener(

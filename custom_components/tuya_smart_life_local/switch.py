@@ -108,11 +108,12 @@ class TuyaDpsSwitch(CoordinatorEntity[TuyaSmartLifeCoordinator], SwitchEntity):
             dps,
         )
         value = dps.get(self.dp_id)
-        if isinstance(value, bool):
+        bool_val = _to_bool(value)
+        if bool_val is not None:
             self._local_ok = True
-            self._state = value
+            self._state = bool_val
             self.async_write_ha_state()
-        else:
+        elif value is not None:
             _LOGGER.debug(
                 "Tuya switch ignored DPS update entity=%s device=%s dp=%s value=%r",
                 self.entity_id,
@@ -131,19 +132,40 @@ class TuyaDpsSwitch(CoordinatorEntity[TuyaSmartLifeCoordinator], SwitchEntity):
         device = self.current_device
         if not device:
             raise RuntimeError(f"Device {self.device.dev_id} is no longer available")
-        response = await self.runtime.local.async_set_dp(device, self.dp_id, value)
-        if isinstance(response, dict) and response.get("Error"):
-            self._local_ok = False
-            self._async_write_state_if_added()
-            raise RuntimeError(
-                f"Unable to set Tuya DP {self.dp_id} for {device.dev_id}: "
-                f"{response.get('Error')}"
-            )
-        self._local_ok = True
+        prev_state = self._state
         self._state = value
-        device.dps[self.dp_id] = value
         self.async_write_ha_state()
+        try:
+            response = await self.runtime.local.async_set_dp(device, self.dp_id, value)
+            if isinstance(response, dict) and response.get("Error"):
+                self._local_ok = False
+                self._state = prev_state
+                self._async_write_state_if_added()
+                raise RuntimeError(
+                    f"Unable to set Tuya DP {self.dp_id} for {device.dev_id}: "
+                    f"{response.get('Error')}"
+                )
+            self._local_ok = True
+            device.dps[self.dp_id] = value
+        except Exception:
+            self._state = prev_state
+            self._async_write_state_if_added()
+            raise
 
     def _async_write_state_if_added(self) -> None:
         if self.entity_id:
             self.async_write_ha_state()
+
+
+def _to_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in ("true", "1", "on"):
+            return True
+        if v in ("false", "0", "off"):
+            return False
+    return None

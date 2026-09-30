@@ -53,9 +53,13 @@ class TuyaSmartLifeCoordinator(DataUpdateCoordinator[TuyaSmartLifeData]):
     async def _async_update_data(self) -> TuyaSmartLifeData:
         try:
             api = TuyaSmartLifeMobileApi(self.config)
+            current_session = self.data.session if self.data else None
+            if current_session and current_session.endpoint:
+                api.endpoint = current_session.endpoint
             homes, devices, ir_actions, session = await self.hass.async_add_executor_job(
                 api.fetch_devices,
                 self.selected_home_ids,
+                current_session,
             )
         except TuyaMobileApiError as err:
             raise UpdateFailed(str(err)) from err

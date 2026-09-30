@@ -401,9 +401,14 @@ async def _async_ensure_datapoint_http_server(hass: HomeAssistant) -> None:
     site = web.TCPSite(runner, "0.0.0.0", DATAPOINT_HTTP_PORT)
     try:
         await site.start()
-    except OSError:
+    except OSError as err:
         await runner.cleanup()
-        raise
+        _LOGGER.warning(
+            "Unable to start Tuya datapoint debug HTTP server on port %s: %s",
+            DATAPOINT_HTTP_PORT,
+            err,
+        )
+        return
 
     hass.data[DATA_HTTP_SERVER] = {"runner": runner, "site": site}
     _LOGGER.info(

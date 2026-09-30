@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import fields
 import ipaddress
 import json
@@ -22,10 +23,10 @@ _LOGGER = logging.getLogger(__name__)
 DISCOVERY_PORTS = (6666, 6667, 6699, 7000)
 DISCOVERY_SCAN_SECONDS = 8
 FORCE_SCAN_INTERVAL_SECONDS = 300
-STATE_STREAM_TIMEOUT_SECONDS = 10
-STATE_STREAM_RECONNECT_SECONDS = 5
+STATE_STREAM_TIMEOUT_SECONDS = 5
+STATE_STREAM_RECONNECT_SECONDS = 3
 STATE_STREAM_HEARTBEAT_SECONDS = 10
-STATE_STREAM_COMMAND_PAUSE_SECONDS = 5.0
+STATE_STREAM_COMMAND_PAUSE_SECONDS = 1.5
 STATE_STREAM_REFRESH_DP_IDS = [4, 5, 6, 18, 19, 20]
 LOCAL_CACHE_VERSION = 1
 LOCAL_CACHE_KEY = "tuya_smart_life_local.local_cache"
@@ -250,7 +251,11 @@ class TuyaLocalRuntime:
         self.transports: list[asyncio.DatagramTransport] = []
         self._tinytuya_devices: dict[str, Any] = {}
         self._stream_tinytuya_devices: dict[str, Any] = {}
-        self._lock = asyncio.Lock()
+        self._device_locks: dict[str, asyncio.Lock] = {}
+        self._stream_executor = ThreadPoolExecutor(
+            max_workers=64,
+            thread_name_prefix="tuya_stream",
+        )
         self._scan_task: asyncio.Task[None] | None = None
         self._state_stream_tasks: dict[str, asyncio.Task[None]] = {}
         self._state_callbacks: list[Callable[[str, dict[str, Any]], None]] = []
@@ -326,6 +331,8 @@ class TuyaLocalRuntime:
             _close_tinytuya_device(device)
         self._tinytuya_devices.clear()
         self._stream_tinytuya_devices.clear()
+        if hasattr(self, "_stream_executor") and self._stream_executor:
+            self._stream_executor.shutdown(wait=False, cancel_futures=True)
         self._last_heartbeat.clear()
         self._stream_synced.clear()
         self._state_stream_pause_until.clear()
@@ -337,7 +344,7 @@ class TuyaLocalRuntime:
                 await self.async_scan_once()
             except Exception:
                 _LOGGER.debug("Tuya UDP scan failed", exc_info=True)
-            await asyncio.sleep(60)
+            await asyncio.sleep(180)
 
     async def async_scan_once(self) -> None:
         await self.hass.async_add_executor_job(self._scan_once)
@@ -538,6 +545,7 @@ class TuyaLocalRuntime:
         return ids
 
     async def _state_stream_loop(self, dev_id: str) -> None:
+        consecutive_failures = 0
         while dev_id in self.devices:
             try:
                 pause_for = self._state_stream_pause_remaining(dev_id)
@@ -549,18 +557,22 @@ class TuyaLocalRuntime:
                     self._stream_synced.discard(dev_id)
                     await asyncio.sleep(pause_for)
                     continue
-                payloads = await self.hass.async_add_executor_job(
+                payloads = await self.hass.loop.run_in_executor(
+                    self._stream_executor,
                     self._receive_state_stream,
                     dev_id,
                 )
+                consecutive_failures = 0
                 for payload in payloads:
                     self._handle_state_stream_payload(dev_id, payload)
             except asyncio.CancelledError:
                 raise
             except Exception as err:
+                consecutive_failures += 1
                 _LOGGER.debug(
-                    "Tuya state stream for %s failed: %s",
+                    "Tuya state stream for %s failed (attempts=%s): %s",
                     dev_id,
+                    consecutive_failures,
                     err,
                     exc_info=True,
                 )
@@ -568,12 +580,16 @@ class TuyaLocalRuntime:
                 self._last_heartbeat.pop(dev_id, None)
                 self._stream_synced.discard(dev_id)
                 self._set_stream_local_connected(dev_id, False)
+                retry_delay = min(
+                    STATE_STREAM_RECONNECT_SECONDS * (2 ** min(consecutive_failures - 1, 4)),
+                    30,
+                )
                 _LOGGER.debug(
                     "Tuya state stream for %s will reconnect in %ss",
                     dev_id,
-                    STATE_STREAM_RECONNECT_SECONDS,
+                    retry_delay,
                 )
-                await asyncio.sleep(STATE_STREAM_RECONNECT_SECONDS)
+                await asyncio.sleep(retry_delay)
 
     def _receive_state_stream(self, dev_id: str) -> list[dict[str, Any]]:
         if self._state_stream_pause_remaining(dev_id) > 0:
@@ -1024,7 +1040,7 @@ class TuyaLocalRuntime:
     def cover_control_dps(self) -> list[tuple[TuyaDeviceDescription, str, str]]:
         items: list[tuple[TuyaDeviceDescription, str, str]] = []
         for device in self.devices.values():
-            if not device.local_controllable or device.is_hub or device.is_child:
+            if not device.local_controllable or device.is_hub or _is_ir_virtual_child(device, self.devices):
                 continue
             dp_id = _cover_control_dp(device)
             if not dp_id:
@@ -1037,7 +1053,7 @@ class TuyaLocalRuntime:
     ) -> list[tuple[TuyaDeviceDescription, str, float | None, str]]:
         items: list[tuple[TuyaDeviceDescription, str, float | None, str]] = []
         for device in self.devices.values():
-            if not device.local_controllable or device.is_hub or device.is_child:
+            if not device.local_controllable or device.is_hub or _is_ir_virtual_child(device, self.devices):
                 continue
             if not _cover_control_dp(device):
                 continue
@@ -1244,6 +1260,19 @@ class TuyaLocalRuntime:
             )
         return sorted(remotes, key=lambda remote: (remote.home_name, remote.remote_name))
 
+    def _device_lock(self, dev_id: str) -> asyncio.Lock:
+        device = self.devices.get(dev_id)
+        lock_id = (
+            device.parent_dev_id
+            if (device and device.is_child and device.parent_dev_id)
+            else dev_id
+        )
+        lock = self._device_locks.get(lock_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._device_locks[lock_id] = lock
+        return lock
+
     async def async_status(self, device: TuyaDeviceDescription) -> dict[str, Any]:
         return await self.hass.async_add_executor_job(self._status, device.dev_id)
 
@@ -1253,7 +1282,7 @@ class TuyaLocalRuntime:
         dp_id: str,
         value: Any,
     ) -> Any:
-        async with self._lock:
+        async with self._device_lock(device.dev_id):
             return await self.hass.async_add_executor_job(
                 self._set_dp,
                 device.dev_id,
@@ -1262,7 +1291,7 @@ class TuyaLocalRuntime:
             )
 
     async def async_publish_ir_action(self, action: TuyaIrAction) -> Any:
-        async with self._lock:
+        async with self._device_lock(action.hub_dev_id):
             return await self.hass.async_add_executor_job(
                 self._publish_ir_action,
                 action,
@@ -1291,7 +1320,7 @@ class TuyaLocalRuntime:
         hub: TuyaDeviceDescription,
         payload: dict[str, Any],
     ) -> Any:
-        async with self._lock:
+        async with self._device_lock(hub.dev_id):
             return await self.hass.async_add_executor_job(
                 self._send_ir_payload,
                 hub.dev_id,
@@ -1717,7 +1746,6 @@ class TuyaLocalRuntime:
             dev_id,
         )
         _close_tinytuya_device(stream_device)
-        time.sleep(1.0)
         self._last_heartbeat.pop(stream_dev_id, None)
         self._stream_synced.discard(stream_dev_id)
         self._tinytuya_devices.pop(stream_dev_id, None)
@@ -1869,10 +1897,10 @@ class TuyaLocalRuntime:
             tuya_device.set_socketPersistent(persistent)
         if hasattr(tuya_device, "set_socketNODELAY"):
             tuya_device.set_socketNODELAY(True)
-        if persistent and hasattr(tuya_device, "set_socketRetryLimit"):
-            tuya_device.set_socketRetryLimit(1)
-        if persistent and hasattr(tuya_device, "set_socketTimeout"):
-            tuya_device.set_socketTimeout(STATE_STREAM_TIMEOUT_SECONDS)
+        if hasattr(tuya_device, "set_socketRetryLimit"):
+            tuya_device.set_socketRetryLimit(1 if persistent else 2)
+        if hasattr(tuya_device, "set_socketTimeout"):
+            tuya_device.set_socketTimeout(STATE_STREAM_TIMEOUT_SECONDS if persistent else 3.0)
         return tuya_device
 
 
@@ -2375,6 +2403,9 @@ def _title_from_code(code: str) -> str:
 def _is_fan_device(device: TuyaDeviceDescription) -> bool:
     product_id = (device.product_id or "").strip().lower()
     if product_id in FAN_PRODUCT_IDS:
+        return True
+    category = (device.category or device.category_code or "").strip().lower()
+    if category in ("fs", "fan"):
         return True
     name = _ascii_fold(device.name).strip().lower()
     if ("fan" in name or "quat" in name) and isinstance(

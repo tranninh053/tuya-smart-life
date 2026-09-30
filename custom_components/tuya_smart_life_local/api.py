@@ -1023,14 +1023,24 @@ class TuyaSmartLifeMobileApi:
     def fetch_devices(
         self,
         selected_home_ids: set[str],
+        session: TuyaSession | None = None,
     ) -> tuple[
         list[TuyaHome],
         list[TuyaDeviceDescription],
         list[TuyaIrAction],
         TuyaSession,
     ]:
-        session = self.login()
-        homes = self.list_homes(session)
+        if session is None:
+            session = self.login()
+        try:
+            homes = self.list_homes(session)
+        except TuyaMobileApiError as err:
+            if "USER_SESSION_INVALID" in str(err):
+                _LOGGER.debug("Tuya session expired during fetch_devices, logging in again")
+                session = self.login()
+                homes = self.list_homes(session)
+            else:
+                raise
         devices: list[TuyaDeviceDescription] = []
         ir_actions: list[TuyaIrAction] = []
         for home in homes:
