@@ -1,0 +1,46 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Tuya Smart Life Local",
+        "description": "Chọn app Tuya hoặc Smart Life, đăng nhập bằng email/số điện thoại và mật khẩu, sau đó chọn nhà cần đồng bộ.",
+        "data": {
+          "email": "Email / số điện thoại",
+          "password": "Mật khẩu",
+          "mobile_app": "Ứng dụng"
+        }
+      },
+      "select_homes": {
+        "title": "Chọn nhà",
+        "description": "Chọn các nhà Tuya muốn đồng bộ vào Home Assistant. Để trống nếu chưa muốn đồng bộ thiết bị.",
+        "data": {
+          "selected_home_ids": "Nhà"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Không thể đăng nhập hoặc lấy danh sách nhà từ Tuya.",
+      "invalid_auth": "Email/số điện thoại hoặc mật khẩu không đúng.",
+      "invalid_client": "Hồ sơ mobile client Tuya/Smart Life đi kèm đã bị server từ chối.",
+      "unsupported_app": "Ứng dụng này chưa được hỗ trợ.",
+      "unknown": "Lỗi không xác định."
+    },
+    "abort": {
+      "already_configured": "Tài khoản Tuya này đã được cấu hình."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Chọn nhà",
+        "description": "Chọn các nhà Tuya muốn đồng bộ vào Home Assistant. Credential Cloud MQTT được tự suy ra.",
+        "data": {
+          "selected_home_ids": "Nhà"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Không thể làm mới danh sách nhà Tuya. Đang hiển thị các nhà đã chọn trước đó."
+    }
+  }
+}

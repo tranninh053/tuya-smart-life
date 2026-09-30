@@ -1,0 +1,96 @@
+set_turn_offf_countdown:
+  name: Hẹn tắt thiết bị Tuya
+  description: Tạo timer cloud một lần để tắt toàn bộ switch DPS của thiết bị sau số phút đã nhập.
+  fields:
+    minutes:
+      name: Số phút
+      description: Số phút tính từ thời điểm gọi action.
+      required: true
+      example: 5
+      selector:
+        number:
+          min: 1
+          max: 1440
+          mode: box
+          unit_of_measurement: phút
+    dev_id:
+      name: Tuya device ID
+      description: ID thiết bị Tuya. Có thể dùng trường này hoặc device_id/id.
+      required: false
+      example: n0kphfrgn3fd0iat
+      selector:
+        text:
+    device_id:
+      name: Home Assistant device ID
+      description: ID thiết bị trong Home Assistant nếu gọi từ UI/script.
+      required: false
+      selector:
+        device:
+          integration: tuya_smart_life_local
+    id:
+      name: ID thiết bị
+      description: Alias cho dev_id để gọi nhanh từ script.
+      required: false
+      selector:
+        text:
+
+clear_countdown:
+  name: Xóa timer thiết bị Tuya
+  description: Xóa toàn bộ timer/lịch cloud đang có của thiết bị.
+  fields:
+    dev_id:
+      name: Tuya device ID
+      description: ID thiết bị Tuya. Có thể dùng trường này hoặc device_id/id.
+      required: false
+      example: n0kphfrgn3fd0iat
+      selector:
+        text:
+    device_id:
+      name: Home Assistant device ID
+      description: ID thiết bị trong Home Assistant nếu gọi từ UI/script.
+      required: false
+      selector:
+        device:
+          integration: tuya_smart_life_local
+    id:
+      name: ID thiết bị
+      description: Alias cho dev_id để gọi nhanh từ script.
+      required: false
+      selector:
+        text:
+
+set_turn_off_countdown:
+  name: Hẹn tắt thiết bị Tuya
+  description: Alias đúng chính tả của set_turn_offf_countdown.
+  fields:
+    minutes:
+      name: Số phút
+      description: Số phút tính từ thời điểm gọi action.
+      required: true
+      example: 5
+      selector:
+        number:
+          min: 1
+          max: 1440
+          mode: box
+          unit_of_measurement: phút
+    dev_id:
+      name: Tuya device ID
+      description: ID thiết bị Tuya. Có thể dùng trường này hoặc device_id/id.
+      required: false
+      example: n0kphfrgn3fd0iat
+      selector:
+        text:
+    device_id:
+      name: Home Assistant device ID
+      description: ID thiết bị trong Home Assistant nếu gọi từ UI/script.
+      required: false
+      selector:
+        device:
+          integration: tuya_smart_life_local
+    id:
+      name: ID thiết bị
+      description: Alias cho dev_id để gọi nhanh từ script.
+      required: false
+      selector:
+        text:

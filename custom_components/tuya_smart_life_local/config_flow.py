@@ -1,0 +1,283 @@
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+import voluptuous as vol
+
+from homeassistant import config_entries
+from homeassistant.const import CONF_EMAIL, CONF_PASSWORD
+from homeassistant.core import callback
+from homeassistant.helpers import selector
+
+from .api import TuyaMobileApiError, TuyaSmartLifeMobileApi
+from .const import (
+    CONF_APP_ID,
+    CONF_APP_RN_VERSION,
+    CONF_APP_SECRET,
+    CONF_API_REGION,
+    CONF_APP_VERSION,
+    CONF_BMP_KEY,
+    CONF_CERT_SHA256,
+    CONF_CHANNEL,
+    CONF_CH_KEY,
+    CONF_COUNTRY_CODE,
+    CONF_CP,
+    CONF_DEVICE_CORE_VERSION,
+    CONF_ET,
+    CONF_MOBILE_APP,
+    CONF_NATIVE_KEY_TEXT,
+    CONF_ND,
+    CONF_OS_SYSTEM,
+    CONF_PACKAGE_NAME,
+    CONF_PLATFORM,
+    CONF_SDK_VERSION,
+    CONF_SELECTED_HOME_IDS,
+    DEFAULT_API_REGION,
+    DEFAULT_MOBILE_APP,
+    CONF_TTID,
+    DOMAIN,
+    MOBILE_APP_SMART_LIFE,
+    MOBILE_APP_TUYA,
+    mobile_app_profile,
+)
+from .models import TuyaHome, TuyaMobileConfig
+
+_LOGGER = logging.getLogger(__name__)
+
+
+def mobile_config_from_data(data: dict[str, Any]) -> TuyaMobileConfig:
+    mobile_app = data.get(CONF_MOBILE_APP, DEFAULT_MOBILE_APP)
+    profile = mobile_app_profile(mobile_app)
+
+    return TuyaMobileConfig(
+        email=data[CONF_EMAIL],
+        password=data[CONF_PASSWORD],
+        mobile_app=mobile_app,
+        country_code=data.get(CONF_COUNTRY_CODE, profile[CONF_COUNTRY_CODE]),
+        api_region=data.get(CONF_API_REGION, DEFAULT_API_REGION),
+        app_id=data.get(CONF_APP_ID, profile[CONF_APP_ID]),
+        app_secret=data.get(CONF_APP_SECRET) or profile.get(CONF_APP_SECRET),
+        cert_sha256=data.get(CONF_CERT_SHA256) or profile.get(CONF_CERT_SHA256),
+        bmp_key=data.get(CONF_BMP_KEY) or profile.get(CONF_BMP_KEY),
+        native_key_text=data.get(CONF_NATIVE_KEY_TEXT) or profile[CONF_NATIVE_KEY_TEXT],
+        package_name=data.get(CONF_PACKAGE_NAME, profile[CONF_PACKAGE_NAME]),
+        app_version=data.get(CONF_APP_VERSION, profile[CONF_APP_VERSION]),
+        app_rn_version=data.get(CONF_APP_RN_VERSION, profile[CONF_APP_RN_VERSION]),
+        sdk_version=data.get(CONF_SDK_VERSION, profile[CONF_SDK_VERSION]),
+        device_core_version=data.get(
+            CONF_DEVICE_CORE_VERSION, profile[CONF_DEVICE_CORE_VERSION]
+        ),
+        os_system=data.get(CONF_OS_SYSTEM, profile[CONF_OS_SYSTEM]),
+        ch_key=data.get(CONF_CH_KEY, profile[CONF_CH_KEY]),
+        ttid=data.get(CONF_TTID, profile[CONF_TTID]),
+        et=data.get(CONF_ET, profile[CONF_ET]),
+        platform=data.get(CONF_PLATFORM, profile[CONF_PLATFORM]),
+        channel=data.get(CONF_CHANNEL, profile[CONF_CHANNEL]),
+        cp=data.get(CONF_CP, profile[CONF_CP]),
+        nd=data.get(CONF_ND, profile[CONF_ND]),
+    )
+
+
+def user_schema(user_input: dict[str, Any] | None = None) -> vol.Schema:
+    values = user_input or {}
+    return vol.Schema(
+        {
+            vol.Optional(
+                CONF_MOBILE_APP,
+                default=values.get(CONF_MOBILE_APP, DEFAULT_MOBILE_APP),
+            ): selector.SelectSelector(
+                selector.SelectSelectorConfig(
+                    options=[
+                        {"value": MOBILE_APP_TUYA, "label": "Tuya"},
+                        {
+                            "value": MOBILE_APP_SMART_LIFE,
+                            "label": "Smart Life",
+                        },
+                    ],
+                    mode=selector.SelectSelectorMode.DROPDOWN,
+                )
+            ),
+            vol.Required(CONF_EMAIL, default=values.get(CONF_EMAIL, "")): str,
+            vol.Required(CONF_PASSWORD): selector.TextSelector(
+                selector.TextSelectorConfig(type=selector.TextSelectorType.PASSWORD)
+            ),
+        }
+    )
+
+
+def homes_schema(
+    homes: list[TuyaHome],
+    selected: list[str] | None = None,
+) -> vol.Schema:
+    default = [home.id for home in homes] if selected is None else selected
+    return vol.Schema(
+        {
+            vol.Required(CONF_SELECTED_HOME_IDS, default=default): (
+                selector.SelectSelector(
+                    selector.SelectSelectorConfig(
+                        options=[
+                            {"value": home.id, "label": f"{home.name} ({home.id})"}
+                            for home in homes
+                        ],
+                        multiple=True,
+                        mode=selector.SelectSelectorMode.DROPDOWN,
+                    )
+                )
+            )
+        }
+    )
+
+
+def selected_home_ids_from_user_input(user_input: dict[str, Any]) -> list[str]:
+    value = user_input.get(CONF_SELECTED_HOME_IDS, [])
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    return [str(home_id) for home_id in value]
+
+
+class TuyaSmartLifeLocalConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
+    VERSION = 1
+
+    def __init__(self) -> None:
+        self._user_data: dict[str, Any] = {}
+        self._homes: list[TuyaHome] = []
+
+    async def async_step_user(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> config_entries.ConfigFlowResult:
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            try:
+                config = mobile_config_from_data(user_input)
+                api = TuyaSmartLifeMobileApi(config)
+                session, homes = await self.hass.async_add_executor_job(
+                    self._login_and_list_homes, api
+                )
+                await self.async_set_unique_id(
+                    f"{user_input[CONF_EMAIL].lower()}:{config.app_id}"
+                )
+                self._abort_if_unique_id_configured()
+                self._user_data = dict(user_input)
+                self._homes = homes
+                _LOGGER.debug(
+                    "Authenticated %s mobile account uid=%s region=%s endpoint=%s homes=%s",
+                    config.mobile_app,
+                    session.uid,
+                    session.region,
+                    session.endpoint,
+                    len(homes),
+                )
+                return await self.async_step_select_homes()
+            except TuyaMobileApiError as err:
+                _LOGGER.warning("Tuya mobile login failed: %s", err)
+                errors["base"] = _error_key_from_mobile_error(err)
+            except Exception:
+                _LOGGER.exception("Unexpected Tuya mobile login error")
+                errors["base"] = "unknown"
+
+        return self.async_show_form(
+            step_id="user",
+            data_schema=user_schema(user_input),
+            errors=errors,
+        )
+
+    async def async_step_select_homes(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> config_entries.ConfigFlowResult:
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            selected = selected_home_ids_from_user_input(user_input)
+            data = dict(self._user_data)
+            data[CONF_SELECTED_HOME_IDS] = selected
+            return self.async_create_entry(
+                title=f"Tuya Smart Life Local ({self._user_data[CONF_EMAIL]})",
+                data=data,
+            )
+
+        return self.async_show_form(
+            step_id="select_homes",
+            data_schema=homes_schema(self._homes),
+            errors=errors,
+        )
+
+    @staticmethod
+    def _login_and_list_homes(
+        api: TuyaSmartLifeMobileApi,
+    ) -> tuple[Any, list[TuyaHome]]:
+        session = api.login()
+        homes = api.list_homes(session)
+        if not homes:
+            raise TuyaMobileApiError("No homes returned by Tuya mobile API")
+        return session, homes
+
+    @staticmethod
+    @callback
+    def async_get_options_flow(
+        config_entry: config_entries.ConfigEntry,
+    ) -> config_entries.OptionsFlow:
+        return TuyaSmartLifeLocalOptionsFlow()
+
+
+def _error_key_from_mobile_error(err: TuyaMobileApiError) -> str:
+    message = str(err).upper()
+    if "ILLEGAL_CLIENT_ID" in message or "CLIENT" in message:
+        return "invalid_client"
+    if (
+        "PASSWORD" in message
+        or "PASSWD" in message
+        or "USER_NOT_EXIST" in message
+        or "USER_NOT_FOUND" in message
+    ):
+        return "invalid_auth"
+    return "cannot_connect"
+
+
+class TuyaSmartLifeLocalOptionsFlow(config_entries.OptionsFlow):
+    def __init__(self) -> None:
+        self._homes: list[TuyaHome] = []
+
+    async def async_step_init(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> config_entries.ConfigFlowResult:
+        errors: dict[str, str] = {}
+        data = {**self.config_entry.data, **self.config_entry.options}
+        if user_input is not None:
+            selected = selected_home_ids_from_user_input(user_input)
+            return self.async_create_entry(
+                title="",
+                data={CONF_SELECTED_HOME_IDS: selected},
+            )
+
+        try:
+            config = mobile_config_from_data(data)
+            api = TuyaSmartLifeMobileApi(config)
+            _, homes = await self.hass.async_add_executor_job(
+                TuyaSmartLifeLocalConfigFlow._login_and_list_homes,
+                api,
+            )
+            self._homes = homes
+        except Exception:
+            _LOGGER.exception("Unable to refresh Tuya homes for options flow")
+            errors["base"] = "cannot_connect"
+            self._homes = [
+                TuyaHome(id=str(home_id), name=str(home_id))
+                for home_id in data.get(CONF_SELECTED_HOME_IDS, [])
+            ]
+
+        selected = list(
+            self.config_entry.options.get(
+                CONF_SELECTED_HOME_IDS,
+                self.config_entry.data.get(CONF_SELECTED_HOME_IDS, []),
+            )
+        )
+        return self.async_show_form(
+            step_id="init",
+            data_schema=homes_schema(self._homes, selected),
+            errors=errors,
+        )
