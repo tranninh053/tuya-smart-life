@@ -7,7 +7,9 @@ from dataclasses import fields
 import ipaddress
 import json
 import logging
+import select
 import socket
+import threading
 import time
 import unicodedata
 from collections.abc import Callable
@@ -22,10 +24,10 @@ _LOGGER = logging.getLogger(__name__)
 
 DISCOVERY_PORTS = (6666, 6667, 6699, 7000)
 DISCOVERY_SCAN_SECONDS = 8
-FORCE_SCAN_INTERVAL_SECONDS = 300
-STATE_STREAM_TIMEOUT_SECONDS = 5
-STATE_STREAM_RECONNECT_SECONDS = 3
-STATE_STREAM_HEARTBEAT_SECONDS = 10
+FORCE_SCAN_INTERVAL_SECONDS = 900
+STATE_STREAM_TIMEOUT_SECONDS = 3
+STATE_STREAM_RECONNECT_SECONDS = 1.5
+STATE_STREAM_HEARTBEAT_SECONDS = 9
 STATE_STREAM_COMMAND_PAUSE_SECONDS = 1.5
 STATE_STREAM_REFRESH_DP_IDS = [4, 5, 6, 18, 19, 20]
 LOCAL_CACHE_VERSION = 1
@@ -252,6 +254,7 @@ class TuyaLocalRuntime:
         self._tinytuya_devices: dict[str, Any] = {}
         self._stream_tinytuya_devices: dict[str, Any] = {}
         self._device_locks: dict[str, asyncio.Lock] = {}
+        self._stream_locks: dict[str, threading.RLock] = {}
         self._stream_executor = ThreadPoolExecutor(
             max_workers=64,
             thread_name_prefix="tuya_stream",
@@ -331,12 +334,26 @@ class TuyaLocalRuntime:
             _close_tinytuya_device(device)
         self._tinytuya_devices.clear()
         self._stream_tinytuya_devices.clear()
+        self._stream_locks.clear()
         if hasattr(self, "_stream_executor") and self._stream_executor:
             self._stream_executor.shutdown(wait=False, cancel_futures=True)
         self._last_heartbeat.clear()
         self._stream_synced.clear()
         self._state_stream_pause_until.clear()
         self._local_connected.clear()
+
+    def _get_stream_lock(self, dev_id: str) -> threading.RLock:
+        device = self.devices.get(dev_id)
+        lock_id = (
+            device.parent_dev_id
+            if (device and device.is_child and device.parent_dev_id)
+            else dev_id
+        )
+        lock = self._stream_locks.get(lock_id)
+        if lock is None:
+            lock = threading.RLock()
+            self._stream_locks[lock_id] = lock
+        return lock
 
     async def _scan_loop(self) -> None:
         while True:
@@ -360,7 +377,16 @@ class TuyaLocalRuntime:
         scan_devices = _tinytuya_scan_devices(self.devices.values())
         force_networks: list[str] | bool = False
         now = time.monotonic()
-        if scan_devices and now - self._last_force_scan >= FORCE_SCAN_INTERVAL_SECONDS:
+        missing_ips = any(
+            not _is_lan_ip(device.ip)
+            for device in self.devices.values()
+            if not device.is_child and bool(device.local_key)
+        )
+        if (
+            scan_devices
+            and missing_ips
+            and now - self._last_force_scan >= FORCE_SCAN_INTERVAL_SECONDS
+        ):
             force_networks = _candidate_force_scan_networks(self.devices.values())
             self._last_force_scan = now
 
@@ -562,9 +588,13 @@ class TuyaLocalRuntime:
                     self._receive_state_stream,
                     dev_id,
                 )
-                consecutive_failures = 0
+                if consecutive_failures > 0:
+                    consecutive_failures = 0
+                    self._set_stream_local_connected(dev_id, True)
                 for payload in payloads:
                     self._handle_state_stream_payload(dev_id, payload)
+                if not payloads:
+                    await asyncio.sleep(0.05)
             except asyncio.CancelledError:
                 raise
             except Exception as err:
@@ -579,13 +609,14 @@ class TuyaLocalRuntime:
                 _close_tinytuya_device(self._stream_tinytuya_devices.pop(dev_id, None))
                 self._last_heartbeat.pop(dev_id, None)
                 self._stream_synced.discard(dev_id)
-                self._set_stream_local_connected(dev_id, False)
+                if consecutive_failures >= 3:
+                    self._set_stream_local_connected(dev_id, False)
                 retry_delay = min(
-                    STATE_STREAM_RECONNECT_SECONDS * (2 ** min(consecutive_failures - 1, 4)),
-                    30,
+                    STATE_STREAM_RECONNECT_SECONDS * (1.5 ** min(consecutive_failures - 1, 4)),
+                    15,
                 )
                 _LOGGER.debug(
-                    "Tuya state stream for %s will reconnect in %ss",
+                    "Tuya state stream for %s will reconnect in %.1fs",
                     dev_id,
                     retry_delay,
                 )
@@ -599,28 +630,42 @@ class TuyaLocalRuntime:
             return []
 
         payloads: list[dict[str, Any]] = []
-        if dev_id not in self._stream_synced:
-            self._stream_synced.add(dev_id)
-            _LOGGER.debug("Tuya state stream %s initial refresh/sync started", dev_id)
-            payloads.extend(self._sync_state_stream(dev_id, device))
+        lock = self._get_stream_lock(dev_id)
 
-        now = time.monotonic()
-        if now - self._last_heartbeat.get(dev_id, 0.0) >= STATE_STREAM_HEARTBEAT_SECONDS:
-            self._last_heartbeat[dev_id] = now
+        with lock:
+            if dev_id not in self._stream_synced:
+                self._stream_synced.add(dev_id)
+                _LOGGER.debug("Tuya state stream %s initial refresh/sync started", dev_id)
+                payloads.extend(self._sync_state_stream(dev_id, device))
+
+            now = time.monotonic()
+            if now - self._last_heartbeat.get(dev_id, 0.0) >= STATE_STREAM_HEARTBEAT_SECONDS:
+                self._last_heartbeat[dev_id] = now
+                try:
+                    import tinytuya
+
+                    heartbeat = device.generate_payload(tinytuya.HEART_BEAT)
+                    device.send(heartbeat)
+                    _LOGGER.debug("Tuya state stream %s heartbeat sent", dev_id)
+                except Exception:
+                    _LOGGER.debug(
+                        "Unable to send Tuya stream heartbeat for %s",
+                        dev_id,
+                        exc_info=True,
+                    )
+
+        sock = getattr(device, "socket", None)
+        if sock:
             try:
-                import tinytuya
+                r, _, _ = select.select([sock], [], [], 0.5)
+            except (ValueError, OSError):
+                r = [sock]
+            if not r:
+                return payloads
 
-                heartbeat = device.generate_payload(tinytuya.HEART_BEAT)
-                device.send(heartbeat)
-                _LOGGER.debug("Tuya state stream %s heartbeat sent", dev_id)
-            except Exception:
-                _LOGGER.debug(
-                    "Unable to send Tuya stream heartbeat for %s",
-                    dev_id,
-                    exc_info=True,
-                )
+        with lock:
+            payload = device.receive()
 
-        payload = device.receive()
         if isinstance(payload, dict):
             if not _response_has_error(payload):
                 self._set_local_connected(dev_id, True)
@@ -1463,23 +1508,24 @@ class TuyaLocalRuntime:
                 persistent=True,
             )
 
-        _LOGGER.debug(
-            "Sending Tuya DP %s for %s via state stream %s",
-            dp_id,
-            dev_id,
-            stream_dev_id,
-        )
-        if hasattr(tuya_device, "set_value"):
-            return _call_tinytuya_writer(
-                tuya_device.set_value,
+        with self._get_stream_lock(stream_dev_id):
+            _LOGGER.debug(
+                "Sending Tuya DP %s for %s via state stream %s",
                 dp_id,
-                value,
-                nowait=True,
+                dev_id,
+                stream_dev_id,
             )
-        try:
-            return tuya_device.set_status(value, switch=dp_id, nowait=True)
-        except TypeError:
-            return tuya_device.set_status(value, switch=dp_id)
+            if hasattr(tuya_device, "set_value"):
+                return _call_tinytuya_writer(
+                    tuya_device.set_value,
+                    dp_id,
+                    value,
+                    nowait=False,
+                )
+            try:
+                return tuya_device.set_status(value, switch=dp_id, nowait=False)
+            except TypeError:
+                return tuya_device.set_status(value, switch=dp_id)
 
     def _set_dp_once(self, dev_id: str, dp_id: int, value: Any) -> Any:
         device = self._tinytuya_device(dev_id)
@@ -1498,12 +1544,13 @@ class TuyaLocalRuntime:
         hub = self.devices.get(action.hub_dev_id)
         if not hub:
             raise RuntimeError(f"IR hub {action.hub_dev_id} is no longer available")
-        self._release_state_stream_for_command(hub.dev_id)
-        try:
-            response = self._publish_ir_dps_once(action)
-        except Exception:
-            self._set_ir_action_local_connected(action, False)
-            raise
+        with self._get_stream_lock(hub.dev_id):
+            try:
+                response = self._publish_ir_dps_once(action)
+            except Exception:
+                self._release_state_stream_for_command(hub.dev_id)
+                self._set_ir_action_local_connected(action, False)
+                raise
         if _is_key_or_version_error(response) or _is_unexpected_payload_error(response):
             _LOGGER.debug(
                 "Retrying Tuya IR action %s via hub %s after response %s",
@@ -1512,11 +1559,12 @@ class TuyaLocalRuntime:
                 response,
             )
             self._tinytuya_devices.pop(hub.dev_id, None)
-            try:
-                response = self._publish_ir_dps_once(action)
-            except Exception:
-                self._set_ir_action_local_connected(action, False)
-                raise
+            with self._get_stream_lock(hub.dev_id):
+                try:
+                    response = self._publish_ir_dps_once(action)
+                except Exception:
+                    self._set_ir_action_local_connected(action, False)
+                    raise
         if _is_key_or_version_error(response) and _is_dp201_ir_action(action):
             _LOGGER.warning(
                 "Tuya IR hub %s returned a key/version response after publishing %s; "
@@ -1545,14 +1593,18 @@ class TuyaLocalRuntime:
 
     def _publish_ir_dps_once(self, action: TuyaIrAction) -> Any:
         target_dev_id = self._ir_publish_target_dev_id(action)
-        device = self._tinytuya_device(target_dev_id)
+        stream_device = self._stream_tinytuya_devices.get(action.hub_dev_id)
+        if stream_device:
+            device = stream_device
+        else:
+            device = self._tinytuya_device(target_dev_id)
         if not device:
             raise RuntimeError(
                 f"IR target {target_dev_id} is missing local metadata or IP"
             )
 
         normalized_dps = _normalize_command_dps(action.action_dps)
-        if _is_normalized_dp201_command(normalized_dps):
+        if _is_normalized_dp201_command(normalized_dps) and not stream_device:
             _close_tinytuya_device(self._tinytuya_devices.pop(target_dev_id, None))
             device = self._tinytuya_device(target_dev_id)
             if not device:
@@ -1621,37 +1673,73 @@ class TuyaLocalRuntime:
         hub = self.devices.get(hub_dev_id)
         if not hub:
             raise RuntimeError(f"IR hub {hub_dev_id} is no longer available")
-        self._release_state_stream_for_command(hub.dev_id)
         value = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-        _close_tinytuya_device(self._tinytuya_devices.pop(hub.dev_id, None))
-        try:
-            response = self._set_dp_once(hub.dev_id, int(IR_SEND_DP_ID), value)
-        except Exception:
-            self._set_local_connected(hub.dev_id, False)
-            raise
-        if _is_key_or_version_error(response) or _is_unexpected_payload_error(response):
-            _LOGGER.debug(
-                "Retrying Tuya IR payload via hub %s after response %s",
-                hub.dev_id,
-                response,
-            )
-            _close_tinytuya_device(self._tinytuya_devices.pop(hub.dev_id, None))
+        with self._get_stream_lock(hub.dev_id):
+            stream_device = self._stream_tinytuya_devices.get(hub.dev_id)
+            if stream_device:
+                tuya_device = stream_device
+            else:
+                _close_tinytuya_device(self._tinytuya_devices.pop(hub.dev_id, None))
+                tuya_device = self._tinytuya_device(hub.dev_id)
+            if not tuya_device:
+                raise RuntimeError(f"IR hub {hub_dev_id} is missing local metadata or IP")
             try:
-                response = self._set_dp_once(hub.dev_id, int(IR_SEND_DP_ID), value)
+                if hasattr(tuya_device, "set_value"):
+                    response = _call_tinytuya_writer(
+                        tuya_device.set_value,
+                        int(IR_SEND_DP_ID),
+                        value,
+                        nowait=True,
+                    )
+                else:
+                    response = _call_tinytuya_writer(
+                        tuya_device.set_status,
+                        value,
+                        switch=int(IR_SEND_DP_ID),
+                        nowait=True,
+                    )
             except Exception:
+                self._release_state_stream_for_command(hub.dev_id)
                 self._set_local_connected(hub.dev_id, False)
                 raise
-        if _is_key_or_version_error(response) or _is_unexpected_payload_error(response):
-            _LOGGER.warning(
-                "Tuya IR hub %s returned %s after DP201 payload; treating "
-                "fire-and-forget command as sent",
-                hub.dev_id,
-                response,
-            )
-            self._set_local_connected(hub.dev_id, True)
-            return None
-        self._set_local_connected(hub.dev_id, not _response_has_error(response))
-        return response
+            if _is_key_or_version_error(response) or _is_unexpected_payload_error(response):
+                _LOGGER.debug(
+                    "Retrying Tuya IR payload via hub %s after response %s",
+                    hub.dev_id,
+                    response,
+                )
+                if not stream_device:
+                    _close_tinytuya_device(self._tinytuya_devices.pop(hub.dev_id, None))
+                    tuya_device = self._tinytuya_device(hub.dev_id)
+                try:
+                    if hasattr(tuya_device, "set_value"):
+                        response = _call_tinytuya_writer(
+                            tuya_device.set_value,
+                            int(IR_SEND_DP_ID),
+                            value,
+                            nowait=True,
+                        )
+                    else:
+                        response = _call_tinytuya_writer(
+                            tuya_device.set_status,
+                            value,
+                            switch=int(IR_SEND_DP_ID),
+                            nowait=True,
+                        )
+                except Exception:
+                    self._set_local_connected(hub.dev_id, False)
+                    raise
+            if _is_key_or_version_error(response) or _is_unexpected_payload_error(response):
+                _LOGGER.warning(
+                    "Tuya IR hub %s returned %s after DP201 payload; treating "
+                    "fire-and-forget command as sent",
+                    hub.dev_id,
+                    response,
+                )
+                self._set_local_connected(hub.dev_id, True)
+                return None
+            self._set_local_connected(hub.dev_id, not _response_has_error(response))
+            return response
 
     def _set_local_connected(self, dev_id: str | None, connected: bool) -> None:
         if not dev_id or dev_id not in self.devices:
@@ -1898,7 +1986,7 @@ class TuyaLocalRuntime:
         if hasattr(tuya_device, "set_socketNODELAY"):
             tuya_device.set_socketNODELAY(True)
         if hasattr(tuya_device, "set_socketRetryLimit"):
-            tuya_device.set_socketRetryLimit(1 if persistent else 2)
+            tuya_device.set_socketRetryLimit(1)
         if hasattr(tuya_device, "set_socketTimeout"):
             tuya_device.set_socketTimeout(STATE_STREAM_TIMEOUT_SECONDS if persistent else 3.0)
         return tuya_device
@@ -2234,21 +2322,25 @@ def _apply_device_dps(
 def _close_tinytuya_device(device: Any | None) -> None:
     if not device:
         return
-    close = getattr(device, "close", None)
-    if callable(close):
-        try:
-            close()
-            return
-        except Exception:
-            pass
     sock = getattr(device, "socket", None)
     if sock:
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except Exception:
+            pass
         try:
             sock.close()
         except Exception:
             pass
         try:
             device.socket = None
+        except Exception:
+            pass
+    close = getattr(device, "close", None)
+    if callable(close):
+        try:
+            close()
+            return
         except Exception:
             pass
 
