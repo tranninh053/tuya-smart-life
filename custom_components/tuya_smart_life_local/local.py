@@ -25,10 +25,9 @@ _LOGGER = logging.getLogger(__name__)
 DISCOVERY_PORTS = (6666, 6667, 6699, 7000)
 DISCOVERY_SCAN_SECONDS = 8
 FORCE_SCAN_INTERVAL_SECONDS = 900
-STATE_STREAM_TIMEOUT_SECONDS = 3
-STATE_STREAM_RECONNECT_SECONDS = 1.5
-STATE_STREAM_HEARTBEAT_SECONDS = 9
-STATE_STREAM_COMMAND_PAUSE_SECONDS = 1.5
+STATE_STREAM_TIMEOUT_SECONDS = 10
+STATE_STREAM_RECONNECT_SECONDS = 5.0
+STATE_STREAM_HEARTBEAT_SECONDS = 20
 STATE_STREAM_REFRESH_DP_IDS = [4, 5, 6, 18, 19, 20]
 LOCAL_CACHE_VERSION = 1
 LOCAL_CACHE_KEY = "tuya_smart_life_local.local_cache"
@@ -256,7 +255,7 @@ class TuyaLocalRuntime:
         self._device_locks: dict[str, asyncio.Lock] = {}
         self._stream_locks: dict[str, threading.RLock] = {}
         self._stream_executor = ThreadPoolExecutor(
-            max_workers=64,
+            max_workers=32,
             thread_name_prefix="tuya_stream",
         )
         self._scan_task: asyncio.Task[None] | None = None
@@ -269,6 +268,7 @@ class TuyaLocalRuntime:
         self._local_connected: dict[str, bool] = {}
         self._last_force_scan = 0.0
         self.mqtt_events: dict[str, dict[str, Any]] = {}
+        self._keepalive_applied: dict[str, int] = {}  # dev_id -> socket fileno
 
     async def async_start(self) -> None:
         if self.transports:
@@ -341,6 +341,7 @@ class TuyaLocalRuntime:
         self._stream_synced.clear()
         self._state_stream_pause_until.clear()
         self._local_connected.clear()
+        self._keepalive_applied.clear()
 
     def _get_stream_lock(self, dev_id: str) -> threading.RLock:
         device = self.devices.get(dev_id)
@@ -356,6 +357,7 @@ class TuyaLocalRuntime:
         return lock
 
     async def _scan_loop(self) -> None:
+        await asyncio.sleep(10)  # Allow HA startup to settle before first scan.
         while True:
             try:
                 await self.async_scan_once()
@@ -467,6 +469,16 @@ class TuyaLocalRuntime:
             for dev_id, connected in self._local_connected.items()
             if dev_id in next_devices
         }
+        self.mqtt_events = {
+            dev_id: event
+            for dev_id, event in self.mqtt_events.items()
+            if dev_id in next_devices
+        }
+        self._device_locks = {
+            lock_id: lock
+            for lock_id, lock in self._device_locks.items()
+            if lock_id in next_devices
+        }
         self._tinytuya_devices.clear()
         self._ensure_state_stream_tasks()
         self._save_local_cache()
@@ -542,6 +554,7 @@ class TuyaLocalRuntime:
                 _close_tinytuya_device(self._stream_tinytuya_devices.pop(dev_id, None))
                 self._last_heartbeat.pop(dev_id, None)
                 self._stream_synced.discard(dev_id)
+                self._keepalive_applied.pop(dev_id, None)
                 self._set_stream_local_connected(dev_id, False)
 
         for dev_id in desired:
@@ -581,6 +594,7 @@ class TuyaLocalRuntime:
                     )
                     self._last_heartbeat.pop(dev_id, None)
                     self._stream_synced.discard(dev_id)
+                    self._keepalive_applied.pop(dev_id, None)
                     await asyncio.sleep(pause_for)
                     continue
                 payloads = await self.hass.loop.run_in_executor(
@@ -588,13 +602,12 @@ class TuyaLocalRuntime:
                     self._receive_state_stream,
                     dev_id,
                 )
-                if consecutive_failures > 0:
+                if payloads and consecutive_failures > 0:
                     consecutive_failures = 0
-                    self._set_stream_local_connected(dev_id, True)
                 for payload in payloads:
                     self._handle_state_stream_payload(dev_id, payload)
                 if not payloads:
-                    await asyncio.sleep(0.05)
+                    await asyncio.sleep(0.25)
             except asyncio.CancelledError:
                 raise
             except Exception as err:
@@ -609,11 +622,12 @@ class TuyaLocalRuntime:
                 _close_tinytuya_device(self._stream_tinytuya_devices.pop(dev_id, None))
                 self._last_heartbeat.pop(dev_id, None)
                 self._stream_synced.discard(dev_id)
+                self._keepalive_applied.pop(dev_id, None)
                 if consecutive_failures >= 3:
                     self._set_stream_local_connected(dev_id, False)
                 retry_delay = min(
                     STATE_STREAM_RECONNECT_SECONDS * (1.5 ** min(consecutive_failures - 1, 4)),
-                    15,
+                    30,
                 )
                 _LOGGER.debug(
                     "Tuya state stream for %s will reconnect in %.1fs",
@@ -634,9 +648,12 @@ class TuyaLocalRuntime:
 
         with lock:
             if dev_id not in self._stream_synced:
-                self._stream_synced.add(dev_id)
-                _LOGGER.debug("Tuya state stream %s initial refresh/sync started", dev_id)
-                payloads.extend(self._sync_state_stream(dev_id, device))
+                sync_payloads = self._sync_state_stream(dev_id, device)
+                if sync_payloads or getattr(device, "socket", None) is not None:
+                    self._stream_synced.add(dev_id)
+                    payloads.extend(sync_payloads)
+                else:
+                    raise ConnectionError(f"Unable to connect Tuya state stream for {dev_id}")
 
             now = time.monotonic()
             if now - self._last_heartbeat.get(dev_id, 0.0) >= STATE_STREAM_HEARTBEAT_SECONDS:
@@ -647,6 +664,13 @@ class TuyaLocalRuntime:
                     heartbeat = device.generate_payload(tinytuya.HEART_BEAT)
                     device.send(heartbeat)
                     _LOGGER.debug("Tuya state stream %s heartbeat sent", dev_id)
+                except (OSError, BrokenPipeError, ConnectionResetError, ConnectionAbortedError) as err:
+                    _LOGGER.debug(
+                        "Tuya state stream %s heartbeat failed, socket dead: %s",
+                        dev_id,
+                        err,
+                    )
+                    raise
                 except Exception:
                     _LOGGER.debug(
                         "Unable to send Tuya stream heartbeat for %s",
@@ -655,16 +679,37 @@ class TuyaLocalRuntime:
                     )
 
         sock = getattr(device, "socket", None)
-        if sock:
-            try:
-                r, _, _ = select.select([sock], [], [], 0.5)
-            except (ValueError, OSError):
-                r = [sock]
-            if not r:
-                return payloads
+        if not sock:
+            raise ConnectionError(f"Tuya state stream socket for {dev_id} is not connected")
+
+        try:
+            fileno = sock.fileno()
+            if self._keepalive_applied.get(dev_id) != fileno:
+                _enable_tcp_keepalive(sock)
+                self._keepalive_applied[dev_id] = fileno
+        except (OSError, ValueError):
+            pass
+        try:
+            r, _, _ = select.select([sock], [], [], 0.5)
+        except (ValueError, OSError):
+            r = [sock]
+        if not r:
+            return payloads
 
         with lock:
-            payload = device.receive()
+            try:
+                payload = device.receive()
+            except (TimeoutError, socket.timeout):
+                return payloads
+            except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError, OSError) as err:
+                _LOGGER.debug("Tuya socket disconnected for %s: %s", dev_id, err)
+                raise
+            except Exception as err:
+                _LOGGER.debug("Tuya device receive error for %s: %s", dev_id, err)
+                return payloads
+
+        if getattr(device, "socket", None) is None:
+            raise ConnectionResetError(f"Tuya state stream socket for {dev_id} closed by peer")
 
         if isinstance(payload, dict):
             if not _response_has_error(payload):
@@ -923,6 +968,7 @@ class TuyaLocalRuntime:
                 )
                 self._last_heartbeat.pop(stream_dev_id, None)
                 self._stream_synced.discard(stream_dev_id)
+                self._keepalive_applied.pop(stream_dev_id, None)
             _LOGGER.debug(
                 "Tuya broadcast updated %s ip=%s version=%s",
                 device.dev_id,
@@ -1458,11 +1504,9 @@ class TuyaLocalRuntime:
                 exc_info=True,
             )
             stream_response = NO_FALLBACK_RESPONSE
-            self._release_state_stream_for_command(dev_id)
         if stream_response is not NO_FALLBACK_RESPONSE:
             self._update_command_local_connection(dev_id, stream_response)
             return stream_response
-        self._release_state_stream_for_command(dev_id)
         try:
             response = self._set_dp_once(dev_id, dp_id, value)
         except Exception:
@@ -1548,7 +1592,9 @@ class TuyaLocalRuntime:
             try:
                 response = self._publish_ir_dps_once(action)
             except Exception:
-                self._release_state_stream_for_command(hub.dev_id)
+                # Only clear the non-stream device cache; keep the keepalive
+                # stream socket alive to avoid TCP TIME_WAIT churn on the IR hub.
+                self._tinytuya_devices.pop(hub.dev_id, None)
                 self._set_ir_action_local_connected(action, False)
                 raise
         if _is_key_or_version_error(response) or _is_unexpected_payload_error(response):
@@ -1699,7 +1745,9 @@ class TuyaLocalRuntime:
                         nowait=True,
                     )
             except Exception:
-                self._release_state_stream_for_command(hub.dev_id)
+                # Only clear the non-stream device cache; keep the keepalive
+                # stream socket alive to avoid TCP TIME_WAIT churn on the IR hub.
+                self._tinytuya_devices.pop(hub.dev_id, None)
                 self._set_local_connected(hub.dev_id, False)
                 raise
             if _is_key_or_version_error(response) or _is_unexpected_payload_error(response):
@@ -1819,33 +1867,6 @@ class TuyaLocalRuntime:
         self._tinytuya_devices.pop(parent.dev_id, None)
         self._tinytuya_devices.pop(device.dev_id, None)
         return last_response
-
-    def _release_state_stream_for_command(self, dev_id: str) -> None:
-        stream_dev_id = self._command_stream_device_id(dev_id)
-        if not stream_dev_id:
-            return
-        self._pause_state_stream_for_command(stream_dev_id)
-        stream_device = self._stream_tinytuya_devices.pop(stream_dev_id, None)
-        if not stream_device:
-            return
-        _LOGGER.debug(
-            "Closing Tuya state stream %s before command for %s",
-            stream_dev_id,
-            dev_id,
-        )
-        _close_tinytuya_device(stream_device)
-        self._last_heartbeat.pop(stream_dev_id, None)
-        self._stream_synced.discard(stream_dev_id)
-        self._tinytuya_devices.pop(stream_dev_id, None)
-        for device in self.devices.values():
-            if device.parent_dev_id == stream_dev_id:
-                self._tinytuya_devices.pop(device.dev_id, None)
-
-    def _pause_state_stream_for_command(self, stream_dev_id: str) -> None:
-        pause_until = time.monotonic() + STATE_STREAM_COMMAND_PAUSE_SECONDS
-        previous = self._state_stream_pause_until.get(stream_dev_id, 0.0)
-        if pause_until > previous:
-            self._state_stream_pause_until[stream_dev_id] = pause_until
 
     def _state_stream_pause_remaining(self, stream_dev_id: str) -> float:
         pause_until = self._state_stream_pause_until.get(stream_dev_id, 0.0)
@@ -2343,6 +2364,22 @@ def _close_tinytuya_device(device: Any | None) -> None:
             return
         except Exception:
             pass
+
+
+def _enable_tcp_keepalive(sock: Any) -> None:
+    """Enable OS-level TCP keepalive to detect dead sockets quickly."""
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        if hasattr(socket, "TCP_KEEPIDLE"):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 10)
+        elif hasattr(socket, "TCP_KEEPALIVE"):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPALIVE, 10)
+        if hasattr(socket, "TCP_KEEPINTVL"):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 5)
+        if hasattr(socket, "TCP_KEEPCNT"):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+    except (OSError, ValueError):
+        pass
 
 
 def _environment_sensor_kind(device: TuyaDeviceDescription, dp_id: Any) -> str | None:
