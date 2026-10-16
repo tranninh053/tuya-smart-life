@@ -735,11 +735,14 @@ class TuyaLocalRuntime:
             return []
 
         payloads: list[dict[str, Any]] = []
-        if hasattr(stream_device, "updatedps"):
+        if hasattr(stream_device, "updatedps") and root.category in {"cz", "pc"}:
             try:
-                response = stream_device.updatedps(STATE_STREAM_REFRESH_DP_IDS)
+                response = _call_tinytuya_writer(
+                    stream_device.updatedps,
+                    STATE_STREAM_REFRESH_DP_IDS,
+                    nowait=True,
+                )
             except Exception:
-                self._set_local_connected(dev_id, False)
                 _LOGGER.debug(
                     "Unable to refresh Tuya state stream for %s",
                     dev_id,
@@ -1374,6 +1377,32 @@ class TuyaLocalRuntime:
         dp_id: str,
         value: Any,
     ) -> Any:
+        mqtt_client = getattr(self, "mqtt", None)
+        has_cloud_mqtt = bool(
+            mqtt_client
+            and hasattr(mqtt_client, "async_publish_dps")
+            and getattr(mqtt_client, "is_connected", False)
+        )
+
+        # Fast-path: When device is known to be offline locally, avoid the blocking
+        # local connection timeout and publish directly to Cloud MQTT for instant ~100ms response.
+        if not self.has_local_connection(device) and has_cloud_mqtt:
+            try:
+                _LOGGER.debug(
+                    "Device %s is offline locally; routing DP %s=%s directly via Cloud MQTT",
+                    device.dev_id,
+                    dp_id,
+                    value,
+                )
+                await mqtt_client.async_publish_dps(device, {str(dp_id): value})
+                return {"success": True, "fallback": "cloud_mqtt"}
+            except Exception as cloud_err:
+                _LOGGER.warning(
+                    "Cloud MQTT fast-path failed for %s, will attempt local: %s",
+                    device.dev_id,
+                    cloud_err,
+                )
+
         response: Any = None
         local_err: Exception | None = None
         try:
@@ -1392,12 +1421,7 @@ class TuyaLocalRuntime:
             return response
 
         # Fallback to Cloud MQTT if local failed or returned error
-        mqtt_client = getattr(self, "mqtt", None)
-        if (
-            mqtt_client
-            and hasattr(mqtt_client, "async_publish_dps")
-            and getattr(mqtt_client, "is_connected", False)
-        ):
+        if has_cloud_mqtt:
             try:
                 _LOGGER.info(
                     "Local set DP failed for %s (response=%s, err=%s); falling back to Cloud MQTT",
@@ -1601,10 +1625,10 @@ class TuyaLocalRuntime:
                     tuya_device.set_value,
                     dp_id,
                     value,
-                    nowait=False,
+                    nowait=True,
                 )
             try:
-                return tuya_device.set_status(value, switch=dp_id, nowait=False)
+                return tuya_device.set_status(value, switch=dp_id, nowait=True)
             except TypeError:
                 return tuya_device.set_status(value, switch=dp_id)
 
@@ -1613,8 +1637,8 @@ class TuyaLocalRuntime:
         if not device:
             raise RuntimeError(f"Device {dev_id} is missing local metadata or IP")
         if hasattr(device, "set_value"):
-            return device.set_value(dp_id, value)
-        return device.set_status(value, switch=dp_id)
+            return _call_tinytuya_writer(device.set_value, dp_id, value, nowait=True)
+        return _call_tinytuya_writer(device.set_status, value, switch=dp_id, nowait=True)
 
     def _publish_ir_action(self, action: TuyaIrAction | str) -> Any:
         if isinstance(action, str):
@@ -2087,9 +2111,9 @@ class TuyaLocalRuntime:
         if hasattr(tuya_device, "set_socketNODELAY"):
             tuya_device.set_socketNODELAY(True)
         if hasattr(tuya_device, "set_socketRetryLimit"):
-            tuya_device.set_socketRetryLimit(1)
+            tuya_device.set_socketRetryLimit(1 if persistent else 0)
         if hasattr(tuya_device, "set_socketTimeout"):
-            tuya_device.set_socketTimeout(STATE_STREAM_TIMEOUT_SECONDS if persistent else 3.0)
+            tuya_device.set_socketTimeout(STATE_STREAM_TIMEOUT_SECONDS if persistent else 1.0)
         return tuya_device
 
 

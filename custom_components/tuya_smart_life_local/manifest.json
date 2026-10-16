@@ -17,5 +17,5 @@
     "paho-mqtt>=2.1.0,<3",
     "cryptography>=42.0.0"
   ],
-  "version": "0.1.67"
+  "version": "0.1.68"
 }

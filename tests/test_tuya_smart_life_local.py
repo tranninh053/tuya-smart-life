@@ -524,6 +524,8 @@ class TestCommandExecutionAndCloudFallback(unittest.IsolatedAsyncioTestCase):
         self.mock_mqtt.async_publish_dps = AsyncMock(return_value=None)
         self.local_runtime.mqtt = self.mock_mqtt
 
+        self.local_runtime._local_connected[self.device.dev_id] = True
+
         async def mock_async_add_executor_job(target, *args):
             return target(*args)
 
@@ -539,6 +541,16 @@ class TestCommandExecutionAndCloudFallback(unittest.IsolatedAsyncioTestCase):
         res = await self.local_runtime.async_set_dp(self.device, "1", True)
         self.assertEqual(res, {"dps": {"1": True}})
         self.mock_mqtt.async_publish_dps.assert_not_called()
+
+    async def test_async_set_dp_fast_path_when_local_offline(self):
+        """When device is disconnected locally, it directly fast-paths to Cloud MQTT without blocking."""
+        self.local_runtime._local_connected[self.device.dev_id] = False
+        self.local_runtime._set_dp = MagicMock()
+
+        res = await self.local_runtime.async_set_dp(self.device, "1", True)
+        self.assertEqual(res, {"success": True, "fallback": "cloud_mqtt"})
+        self.mock_mqtt.async_publish_dps.assert_awaited_once_with(self.device, {"1": True})
+        self.local_runtime._set_dp.assert_not_called()
 
     async def test_async_set_dp_fallback_on_local_error_dict(self):
         """When local execution returns {'Error': ...}, Cloud MQTT fallback is called."""
