@@ -25,7 +25,7 @@ _LOGGER = logging.getLogger(__name__)
 DISCOVERY_PORTS = (6666, 6667, 6699, 7000)
 DISCOVERY_SCAN_SECONDS = 8
 FORCE_SCAN_INTERVAL_SECONDS = 900
-STATE_STREAM_TIMEOUT_SECONDS = 10
+STATE_STREAM_TIMEOUT_SECONDS = 2.0
 STATE_STREAM_RECONNECT_SECONDS = 2.0
 STATE_STREAM_HEARTBEAT_SECONDS = 20
 STATE_STREAM_REFRESH_DP_IDS = [4, 5, 6, 18, 19, 20]
@@ -615,7 +615,7 @@ class TuyaLocalRuntime:
                     self._receive_state_stream,
                     dev_id,
                 )
-                if payloads and consecutive_failures > 0:
+                if consecutive_failures > 0:
                     consecutive_failures = 0
                 for payload in payloads:
                     self._handle_state_stream_payload(dev_id, payload)
@@ -636,7 +636,7 @@ class TuyaLocalRuntime:
                 self._last_heartbeat.pop(dev_id, None)
                 self._stream_synced.discard(dev_id)
                 self._keepalive_applied.pop(dev_id, None)
-                if consecutive_failures >= 3:
+                if consecutive_failures >= 6:
                     self._set_stream_local_connected(dev_id, False)
                 retry_delay = min(
                     STATE_STREAM_RECONNECT_SECONDS * (1.5 ** min(consecutive_failures - 1, 4)),
@@ -664,6 +664,7 @@ class TuyaLocalRuntime:
                 sync_payloads = self._sync_state_stream(dev_id, device)
                 if sync_payloads or getattr(device, "socket", None) is not None:
                     self._stream_synced.add(dev_id)
+                    self._set_stream_local_connected(dev_id, True)
                     payloads.extend(sync_payloads)
                 else:
                     raise ConnectionError(f"Unable to connect Tuya state stream for {dev_id}")
@@ -672,12 +673,15 @@ class TuyaLocalRuntime:
             if now - self._last_heartbeat.get(dev_id, 0.0) >= STATE_STREAM_HEARTBEAT_SECONDS:
                 self._last_heartbeat[dev_id] = now
                 try:
-                    import tinytuya
+                    if hasattr(device, "heartbeat"):
+                        device.heartbeat(nowait=False)
+                    else:
+                        import tinytuya
 
-                    heartbeat = device.generate_payload(tinytuya.HEART_BEAT)
-                    device.send(heartbeat)
-                    _LOGGER.debug("Tuya state stream %s heartbeat sent", dev_id)
-                except (OSError, BrokenPipeError, ConnectionResetError, ConnectionAbortedError) as err:
+                        heartbeat = device.generate_payload(tinytuya.HEART_BEAT)
+                        device.send(heartbeat)
+                    _LOGGER.debug("Tuya state stream %s heartbeat acknowledged", dev_id)
+                except (OSError, BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError, socket.timeout) as err:
                     _LOGGER.debug(
                         "Tuya state stream %s heartbeat failed, socket dead: %s",
                         dev_id,
@@ -802,7 +806,6 @@ class TuyaLocalRuntime:
             try:
                 response = tuya_device.status()
             except Exception:
-                self._set_local_connected(endpoint.dev_id, False)
                 _LOGGER.debug(
                     "Unable to sync Tuya state stream for %s via %s",
                     endpoint.dev_id,
@@ -811,10 +814,10 @@ class TuyaLocalRuntime:
                 )
                 continue
             if isinstance(response, dict):
-                connected = not _response_has_error(response)
-                self._set_local_connected(endpoint.dev_id, connected)
-                if endpoint.dev_id != dev_id:
-                    self._set_local_connected(dev_id, connected)
+                if not _response_has_error(response):
+                    self._set_local_connected(endpoint.dev_id, True)
+                    if endpoint.dev_id != dev_id:
+                        self._set_local_connected(dev_id, True)
                 if endpoint.dev_id != dev_id and endpoint.node_id:
                     response.setdefault("cid", endpoint.node_id)
                 _LOGGER.debug(
@@ -1648,10 +1651,11 @@ class TuyaLocalRuntime:
         try:
             response = self._set_dp_once(dev_id, dp_id, value)
         except Exception:
-            self._set_local_connected(dev_id, False)
-            stream_dev_id = self._command_stream_device_id(dev_id)
-            if stream_dev_id and stream_dev_id != dev_id:
-                self._set_local_connected(stream_dev_id, False)
+            if dev_id not in self._state_stream_tasks:
+                self._set_local_connected(dev_id, False)
+                stream_dev_id = self._command_stream_device_id(dev_id)
+                if stream_dev_id and stream_dev_id != dev_id:
+                    self._set_local_connected(stream_dev_id, False)
             raise
         if _is_key_or_version_error(response):
             fallback = self._try_protocol_fallback(dev_id, dp_id, value)
@@ -2191,7 +2195,7 @@ class TuyaLocalRuntime:
         if hasattr(tuya_device, "set_socketNODELAY"):
             tuya_device.set_socketNODELAY(True)
         if hasattr(tuya_device, "set_socketRetryLimit"):
-            tuya_device.set_socketRetryLimit(1)
+            tuya_device.set_socketRetryLimit(0 if persistent else 1)
         if hasattr(tuya_device, "set_socketTimeout"):
             tuya_device.set_socketTimeout(STATE_STREAM_TIMEOUT_SECONDS if persistent else 1.0)
         tuya_device.connection_timeout = 2.0 if persistent else 1.0

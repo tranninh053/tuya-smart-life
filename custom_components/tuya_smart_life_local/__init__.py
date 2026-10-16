@@ -746,7 +746,11 @@ def _remove_stale_registry_entries(
     if not callable(remove_device):
         return
     for device in list(device_registry.devices.values()):
-        device_entries = getattr(device, "config_entries", None) or {getattr(device, "config_entry_id", None)}
+        config_entry_id = getattr(device, "config_entry_id", None)
+        if config_entry_id:
+            device_entries = {config_entry_id}
+        else:
+            device_entries = getattr(device, "config_entries", set()) or set()
         if entry.entry_id not in device_entries:
             continue
         tuya_ids = {

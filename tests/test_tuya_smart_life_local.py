@@ -790,11 +790,12 @@ class TestRapidToggleCoalescingAndOptimisticLockout(unittest.IsolatedAsyncioTest
         self.assertIsNone(switch._target_state, "Target state should be cleared once achieved")
 
     def test_make_tinytuya_device_retry_limit_always_nonzero(self):
-        """Verify _make_tinytuya_device configures socketRetryLimit to at least 1 for all connections."""
+        """Verify _make_tinytuya_device configures socketRetryLimit to 1 for one-off and 0 for persistent."""
         mock_tinytuya = MagicMock()
         mock_device = MagicMock()
         mock_tinytuya.OutletDevice.return_value = mock_device
 
+        # One-off command connection
         dev = self.local_runtime._make_tinytuya_device(
             mock_tinytuya,
             self.device,
@@ -804,6 +805,19 @@ class TestRapidToggleCoalescingAndOptimisticLockout(unittest.IsolatedAsyncioTest
             persistent=False,
         )
         mock_device.set_socketRetryLimit.assert_called_with(1)
+
+        # Persistent stream connection (must be 0 to avoid blocking on empty heartbeat/ACK packets)
+        mock_device_stream = MagicMock()
+        mock_tinytuya.OutletDevice.return_value = mock_device_stream
+        dev_stream = self.local_runtime._make_tinytuya_device(
+            mock_tinytuya,
+            self.device,
+            "192.168.31.210",
+            "key1234567890123",
+            parent=None,
+            persistent=True,
+        )
+        mock_device_stream.set_socketRetryLimit.assert_called_with(0)
 
 
 if __name__ == "__main__":
