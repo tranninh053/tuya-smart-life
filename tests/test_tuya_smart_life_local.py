@@ -819,6 +819,47 @@ class TestRapidToggleCoalescingAndOptimisticLockout(unittest.IsolatedAsyncioTest
         )
         mock_device_stream.set_socketRetryLimit.assert_called_with(1)
 
+    def test_sync_state_stream_ignores_error_responses(self):
+        """Verify _sync_state_stream does not treat error responses as valid payloads or connected."""
+        self.local_runtime._local_connected[self.device.dev_id] = False
+        mock_tinytuya = MagicMock()
+        mock_device = MagicMock()
+        mock_device.status.return_value = {"Error": "Device unreachable", "Err": "914", "Payload": None}
+        mock_device.updatedps.return_value = {"Error": "Device unreachable", "Err": "914"}
+
+        with patch.dict(sys.modules, {"tinytuya": mock_tinytuya}):
+            payloads = self.local_runtime._sync_state_stream(self.device.dev_id, mock_device)
+
+        self.assertEqual(payloads, [])
+        self.assertFalse(self.local_runtime._local_connected.get(self.device.dev_id, False))
+
+    def test_receive_state_stream_raises_without_falsely_connecting(self):
+        """Verify _receive_state_stream raises ConnectionError without setting connected=True when socket is dead."""
+        self.local_runtime._local_connected[self.device.dev_id] = False
+        mock_tinytuya_dev = MagicMock()
+        mock_tinytuya_dev.socket = None
+        self.local_runtime._stream_tinytuya_devices[self.device.dev_id] = mock_tinytuya_dev
+        self.local_runtime._stream_synced.discard(self.device.dev_id)
+        self.local_runtime._sync_state_stream = MagicMock(return_value=[])
+
+        with self.assertRaises(ConnectionError):
+            self.local_runtime._receive_state_stream(self.device.dev_id)
+
+        self.assertNotIn(self.device.dev_id, self.local_runtime._stream_synced)
+        self.assertFalse(self.local_runtime._local_connected.get(self.device.dev_id, False))
+
+    def test_has_active_local_stream_rejects_closed_socket(self):
+        """Verify has_active_local_stream returns False when socket fileno is negative."""
+        mock_stream_dev = MagicMock()
+        mock_sock = MagicMock()
+        mock_sock.fileno.return_value = -1
+        mock_stream_dev.socket = mock_sock
+        self.local_runtime._stream_tinytuya_devices[self.device.dev_id] = mock_stream_dev
+        self.local_runtime._local_connected[self.device.dev_id] = True
+
+        self.assertFalse(self.local_runtime.has_active_local_stream(self.device))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+

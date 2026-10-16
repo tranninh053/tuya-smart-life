@@ -636,11 +636,11 @@ class TuyaLocalRuntime:
                 self._last_heartbeat.pop(dev_id, None)
                 self._stream_synced.discard(dev_id)
                 self._keepalive_applied.pop(dev_id, None)
-                if consecutive_failures >= 6:
+                if consecutive_failures >= 3:
                     self._set_stream_local_connected(dev_id, False)
                 retry_delay = min(
-                    STATE_STREAM_RECONNECT_SECONDS * (1.5 ** min(consecutive_failures - 1, 4)),
-                    30,
+                    STATE_STREAM_RECONNECT_SECONDS * (2.0 ** min(consecutive_failures - 1, 5)),
+                    60,
                 )
                 _LOGGER.debug(
                     "Tuya state stream for %s will reconnect in %.1fs",
@@ -662,10 +662,19 @@ class TuyaLocalRuntime:
         with lock:
             if dev_id not in self._stream_synced:
                 sync_payloads = self._sync_state_stream(dev_id, device)
-                if sync_payloads or getattr(device, "socket", None) is not None:
+                sock = getattr(device, "socket", None)
+                sock_alive = False
+                if sock is not None:
+                    try:
+                        fn = sock.fileno()
+                        sock_alive = not (isinstance(fn, int) and fn < 0)
+                    except (OSError, ValueError):
+                        sock_alive = False
+                if sock_alive:
                     self._stream_synced.add(dev_id)
-                    self._set_stream_local_connected(dev_id, True)
-                    payloads.extend(sync_payloads)
+                    if sync_payloads:
+                        self._set_stream_local_connected(dev_id, True)
+                        payloads.extend(sync_payloads)
                 else:
                     raise ConnectionError(f"Unable to connect Tuya state stream for {dev_id}")
 
@@ -693,8 +702,14 @@ class TuyaLocalRuntime:
                     )
 
         sock = getattr(device, "socket", None)
-        if not sock:
+        if sock is None:
             raise ConnectionError(f"Tuya state stream socket for {dev_id} is not connected")
+        try:
+            fn = sock.fileno()
+            if isinstance(fn, int) and fn < 0:
+                raise ConnectionError(f"Tuya state stream socket for {dev_id} is closed")
+        except (OSError, ValueError):
+            raise ConnectionError(f"Tuya state stream socket for {dev_id} is invalid")
 
         try:
             fileno = sock.fileno()
@@ -732,12 +747,18 @@ class TuyaLocalRuntime:
         if isinstance(payload, dict):
             if not _response_has_error(payload):
                 self._set_local_connected(dev_id, True)
-            _LOGGER.debug(
-                "Tuya state stream %s received %s",
-                dev_id,
-                _state_stream_payload_summary(payload),
-            )
-            payloads.append(payload)
+                _LOGGER.debug(
+                    "Tuya state stream %s received %s",
+                    dev_id,
+                    _state_stream_payload_summary(payload),
+                )
+                payloads.append(payload)
+            else:
+                _LOGGER.debug(
+                    "Tuya state stream %s received error response: %s",
+                    dev_id,
+                    _state_stream_payload_summary(payload),
+                )
         return payloads
 
     def _sync_state_stream(self, dev_id: str, stream_device: Any) -> list[dict[str, Any]]:
@@ -767,16 +788,20 @@ class TuyaLocalRuntime:
                 )
             else:
                 if isinstance(response, dict):
-                    self._set_local_connected(
-                        dev_id,
-                        not _response_has_error(response),
-                    )
-                    _LOGGER.debug(
-                        "Tuya state stream %s refresh response %s",
-                        dev_id,
-                        _state_stream_payload_summary(response),
-                    )
-                    payloads.append(response)
+                    if not _response_has_error(response):
+                        self._set_local_connected(dev_id, True)
+                        _LOGGER.debug(
+                            "Tuya state stream %s refresh response %s",
+                            dev_id,
+                            _state_stream_payload_summary(response),
+                        )
+                        payloads.append(response)
+                    else:
+                        _LOGGER.debug(
+                            "Tuya state stream %s refresh error response %s",
+                            dev_id,
+                            _state_stream_payload_summary(response),
+                        )
                 else:
                     _LOGGER.debug(
                         "Tuya state stream %s refresh response type=%s value=%r",
@@ -819,16 +844,23 @@ class TuyaLocalRuntime:
                     self._set_local_connected(endpoint.dev_id, True)
                     if endpoint.dev_id != dev_id:
                         self._set_local_connected(dev_id, True)
-                if endpoint.dev_id != dev_id and endpoint.node_id:
-                    response.setdefault("cid", endpoint.node_id)
-                _LOGGER.debug(
-                    "Tuya state stream %s sync endpoint=%s node=%s response=%s",
-                    dev_id,
-                    endpoint.dev_id,
-                    endpoint.node_id,
-                    _state_stream_payload_summary(response),
-                )
-                payloads.append(response)
+                    if endpoint.dev_id != dev_id and endpoint.node_id:
+                        response.setdefault("cid", endpoint.node_id)
+                    _LOGGER.debug(
+                        "Tuya state stream %s sync endpoint=%s node=%s response=%s",
+                        dev_id,
+                        endpoint.dev_id,
+                        endpoint.node_id,
+                        _state_stream_payload_summary(response),
+                    )
+                    payloads.append(response)
+                else:
+                    _LOGGER.debug(
+                        "Tuya state stream %s sync endpoint=%s error response: %s",
+                        dev_id,
+                        endpoint.dev_id,
+                        _state_stream_payload_summary(response),
+                    )
             else:
                 _LOGGER.debug(
                     "Tuya state stream %s sync endpoint=%s node=%s response type=%s value=%r",
@@ -1240,6 +1272,8 @@ class TuyaLocalRuntime:
     def has_active_local_stream(self, device: TuyaDeviceDescription | None) -> bool:
         if not device:
             return False
+        if not self.has_local_connection(device):
+            return False
         stream_dev_id = self._command_stream_device_id(device.dev_id)
         if not stream_dev_id:
             return False
@@ -1247,7 +1281,15 @@ class TuyaLocalRuntime:
         if not stream_device:
             return False
         sock = getattr(stream_device, "socket", None)
-        return sock is not None
+        if sock is None:
+            return False
+        try:
+            fn = sock.fileno()
+            if isinstance(fn, int) and fn < 0:
+                return False
+        except (OSError, ValueError):
+            return False
+        return True
 
     def has_ir_local_connection(self, remote_id: str, hub_dev_id: str) -> bool:
         remote = self.devices.get(remote_id)
@@ -1672,6 +1714,15 @@ class TuyaLocalRuntime:
             return NO_FALLBACK_RESPONSE
         stream_device = self._stream_tinytuya_devices.get(stream_dev_id)
         if not stream_device:
+            return NO_FALLBACK_RESPONSE
+        sock = getattr(stream_device, "socket", None)
+        if sock is None:
+            return NO_FALLBACK_RESPONSE
+        try:
+            fn = sock.fileno()
+            if isinstance(fn, int) and fn < 0:
+                return NO_FALLBACK_RESPONSE
+        except (OSError, ValueError):
             return NO_FALLBACK_RESPONSE
 
         target = self.devices.get(dev_id)
