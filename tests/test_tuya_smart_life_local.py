@@ -806,7 +806,7 @@ class TestRapidToggleCoalescingAndOptimisticLockout(unittest.IsolatedAsyncioTest
         )
         mock_device.set_socketRetryLimit.assert_called_with(1)
 
-        # Persistent stream connection (must be 0 to avoid blocking on empty heartbeat/ACK packets)
+        # Persistent stream connection
         mock_device_stream = MagicMock()
         mock_tinytuya.OutletDevice.return_value = mock_device_stream
         dev_stream = self.local_runtime._make_tinytuya_device(
@@ -817,7 +817,7 @@ class TestRapidToggleCoalescingAndOptimisticLockout(unittest.IsolatedAsyncioTest
             parent=None,
             persistent=True,
         )
-        mock_device_stream.set_socketRetryLimit.assert_called_with(0)
+        mock_device_stream.set_socketRetryLimit.assert_called_with(1)
 
 
 if __name__ == "__main__":

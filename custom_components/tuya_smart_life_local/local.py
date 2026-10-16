@@ -673,15 +673,12 @@ class TuyaLocalRuntime:
             if now - self._last_heartbeat.get(dev_id, 0.0) >= STATE_STREAM_HEARTBEAT_SECONDS:
                 self._last_heartbeat[dev_id] = now
                 try:
-                    if hasattr(device, "heartbeat"):
-                        device.heartbeat(nowait=False)
-                    else:
-                        import tinytuya
+                    import tinytuya
 
-                        heartbeat = device.generate_payload(tinytuya.HEART_BEAT)
-                        device.send(heartbeat)
-                    _LOGGER.debug("Tuya state stream %s heartbeat acknowledged", dev_id)
-                except (OSError, BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError, socket.timeout) as err:
+                    heartbeat = device.generate_payload(tinytuya.HEART_BEAT)
+                    device.send(heartbeat)
+                    _LOGGER.debug("Tuya state stream %s heartbeat sent", dev_id)
+                except (OSError, BrokenPipeError, ConnectionResetError, ConnectionAbortedError) as err:
                     _LOGGER.debug(
                         "Tuya state stream %s heartbeat failed, socket dead: %s",
                         dev_id,
@@ -715,7 +712,11 @@ class TuyaLocalRuntime:
 
         with lock:
             try:
-                payload = device.receive()
+                if hasattr(device, "_receive") and hasattr(device, "_process_message"):
+                    msg = device._receive()
+                    payload = device._process_message(msg) if msg else None
+                else:
+                    payload = device.receive()
             except (TimeoutError, socket.timeout):
                 return payloads
             except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError, OSError) as err:
@@ -2195,7 +2196,7 @@ class TuyaLocalRuntime:
         if hasattr(tuya_device, "set_socketNODELAY"):
             tuya_device.set_socketNODELAY(True)
         if hasattr(tuya_device, "set_socketRetryLimit"):
-            tuya_device.set_socketRetryLimit(0 if persistent else 1)
+            tuya_device.set_socketRetryLimit(1)
         if hasattr(tuya_device, "set_socketTimeout"):
             tuya_device.set_socketTimeout(STATE_STREAM_TIMEOUT_SECONDS if persistent else 1.0)
         tuya_device.connection_timeout = 2.0 if persistent else 1.0
