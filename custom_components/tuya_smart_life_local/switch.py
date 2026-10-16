@@ -151,7 +151,7 @@ class TuyaDpsSwitch(CoordinatorEntity[TuyaSmartLifeCoordinator], SwitchEntity):
         prev_state = self._state
         self._state = value
         self._target_state = value
-        self._target_state_until = time.monotonic() + 1.2
+        self._target_state_until = time.monotonic() + 2.0
         self.async_write_ha_state()
         try:
             response = await self.runtime.local.async_set_dp(device, self.dp_id, value)

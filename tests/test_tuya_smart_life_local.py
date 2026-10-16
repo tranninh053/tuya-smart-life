@@ -859,6 +859,76 @@ class TestRapidToggleCoalescingAndOptimisticLockout(unittest.IsolatedAsyncioTest
 
         self.assertFalse(self.local_runtime.has_active_local_stream(self.device))
 
+    def test_is_socket_closed_detects_peer_disconnect(self):
+        """Verify _is_socket_closed detects when remote peer closes the TCP socket."""
+        import socket
+        from custom_components.tuya_smart_life_local.local import _is_socket_closed
+
+        s1, s2 = socket.socketpair()
+        try:
+            self.assertFalse(_is_socket_closed(s1))
+            self.assertFalse(_is_socket_closed(s2))
+            s2.close()
+            # s1 should immediately be identified as closed because EOF was signaled
+            self.assertTrue(_is_socket_closed(s1))
+        finally:
+            s1.close()
+
+    def test_has_active_local_stream_returns_false_on_peer_closed_socket(self):
+        """Verify has_active_local_stream returns False when a real socket's peer closed."""
+        import socket
+
+        s1, s2 = socket.socketpair()
+        try:
+            mock_stream_dev = MagicMock()
+            mock_stream_dev.socket = s1
+            self.local_runtime._stream_tinytuya_devices[self.device.dev_id] = mock_stream_dev
+            self.local_runtime._local_connected[self.device.dev_id] = True
+
+            self.assertTrue(self.local_runtime.has_active_local_stream(self.device))
+            s2.close()
+            self.assertFalse(self.local_runtime.has_active_local_stream(self.device))
+        finally:
+            s1.close()
+
+    def test_receive_state_stream_raises_connection_reset_on_decode_error(self):
+        """Verify _receive_state_stream raises ConnectionResetError when _receive raises DecodeError."""
+        import tinytuya
+
+        self.local_runtime._local_connected[self.device.dev_id] = True
+        mock_tinytuya_dev = MagicMock()
+        mock_sock = MagicMock()
+        mock_sock.fileno.return_value = 12
+        mock_tinytuya_dev.socket = mock_sock
+        mock_tinytuya_dev._receive.side_effect = tinytuya.DecodeError("No data received - connection closed?")
+        self.local_runtime._stream_tinytuya_devices[self.device.dev_id] = mock_tinytuya_dev
+        self.local_runtime._stream_synced.add(self.device.dev_id)
+
+        with patch("custom_components.tuya_smart_life_local.local.select.select", return_value=([mock_sock], [], [])):
+            with self.assertRaises(ConnectionResetError):
+                self.local_runtime._receive_state_stream(self.device.dev_id)
+
+    def test_set_dp_via_state_stream_cleans_up_and_fails_over_on_peer_close(self):
+        """Verify _set_dp_via_state_stream detects dead socket, purges stream, and returns NO_FALLBACK_RESPONSE."""
+        import socket
+        from custom_components.tuya_smart_life_local.local import NO_FALLBACK_RESPONSE
+
+        s1, s2 = socket.socketpair()
+        try:
+            mock_stream_dev = MagicMock()
+            mock_stream_dev.socket = s1
+            self.local_runtime._stream_tinytuya_devices[self.device.dev_id] = mock_stream_dev
+            self.local_runtime._local_connected[self.device.dev_id] = True
+
+            # Close remote peer
+            s2.close()
+
+            res = self.local_runtime._set_dp_via_state_stream(self.device.dev_id, 1, True)
+            self.assertIs(res, NO_FALLBACK_RESPONSE)
+            self.assertNotIn(self.device.dev_id, self.local_runtime._stream_tinytuya_devices)
+        finally:
+            s1.close()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -638,8 +638,8 @@ class TuyaLocalRuntime:
                 self._keepalive_applied.pop(dev_id, None)
                 if consecutive_failures >= 3:
                     self._set_stream_local_connected(dev_id, False)
-                retry_delay = min(
-                    STATE_STREAM_RECONNECT_SECONDS * (2.0 ** min(consecutive_failures - 1, 5)),
+                retry_delay = 1.0 if consecutive_failures == 1 else min(
+                    STATE_STREAM_RECONNECT_SECONDS * (2.0 ** min(consecutive_failures - 2, 4)),
                     60,
                 )
                 _LOGGER.debug(
@@ -702,14 +702,8 @@ class TuyaLocalRuntime:
                     )
 
         sock = getattr(device, "socket", None)
-        if sock is None:
-            raise ConnectionError(f"Tuya state stream socket for {dev_id} is not connected")
-        try:
-            fn = sock.fileno()
-            if isinstance(fn, int) and fn < 0:
-                raise ConnectionError(f"Tuya state stream socket for {dev_id} is closed")
-        except (OSError, ValueError):
-            raise ConnectionError(f"Tuya state stream socket for {dev_id} is invalid")
+        if _is_socket_closed(sock):
+            raise ConnectionError(f"Tuya state stream socket for {dev_id} is closed or disconnected")
 
         try:
             fileno = sock.fileno()
@@ -726,6 +720,8 @@ class TuyaLocalRuntime:
             return payloads
 
         with lock:
+            if _is_socket_closed(sock):
+                raise ConnectionResetError(f"Tuya state stream socket for {dev_id} closed by peer")
             try:
                 if hasattr(device, "_receive") and hasattr(device, "_process_message"):
                     msg = device._receive()
@@ -738,6 +734,10 @@ class TuyaLocalRuntime:
                 _LOGGER.debug("Tuya socket disconnected for %s: %s", dev_id, err)
                 raise
             except Exception as err:
+                err_msg = str(err).lower()
+                if "connection closed" in err_msg or "closed by peer" in err_msg or "decodeerror" in type(err).__name__.lower():
+                    _LOGGER.debug("Tuya state stream socket closed (%s): %s", dev_id, err)
+                    raise ConnectionResetError(f"Tuya socket closed for {dev_id}: {err}") from err
                 _LOGGER.debug("Tuya device receive error for %s: %s", dev_id, err)
                 return payloads
 
@@ -1281,13 +1281,7 @@ class TuyaLocalRuntime:
         if not stream_device:
             return False
         sock = getattr(stream_device, "socket", None)
-        if sock is None:
-            return False
-        try:
-            fn = sock.fileno()
-            if isinstance(fn, int) and fn < 0:
-                return False
-        except (OSError, ValueError):
+        if _is_socket_closed(sock):
             return False
         return True
 
@@ -1716,13 +1710,17 @@ class TuyaLocalRuntime:
         if not stream_device:
             return NO_FALLBACK_RESPONSE
         sock = getattr(stream_device, "socket", None)
-        if sock is None:
-            return NO_FALLBACK_RESPONSE
-        try:
-            fn = sock.fileno()
-            if isinstance(fn, int) and fn < 0:
-                return NO_FALLBACK_RESPONSE
-        except (OSError, ValueError):
+        if _is_socket_closed(sock):
+            _LOGGER.debug(
+                "Tuya state stream socket for %s is closed before DP %s dispatch",
+                stream_dev_id,
+                dp_id,
+            )
+            _close_tinytuya_device(self._stream_tinytuya_devices.pop(stream_dev_id, None))
+            self._last_heartbeat.pop(stream_dev_id, None)
+            self._stream_synced.discard(stream_dev_id)
+            self._keepalive_applied.pop(stream_dev_id, None)
+            self._set_stream_local_connected(stream_dev_id, False)
             return NO_FALLBACK_RESPONSE
 
         target = self.devices.get(dev_id)
@@ -1750,23 +1748,88 @@ class TuyaLocalRuntime:
                 self._stream_child_devices[dev_id] = tuya_device
 
         with self._get_stream_lock(stream_dev_id):
+            if _is_socket_closed(sock):
+                _close_tinytuya_device(self._stream_tinytuya_devices.pop(stream_dev_id, None))
+                self._last_heartbeat.pop(stream_dev_id, None)
+                self._stream_synced.discard(stream_dev_id)
+                self._keepalive_applied.pop(stream_dev_id, None)
+                self._set_stream_local_connected(stream_dev_id, False)
+                return NO_FALLBACK_RESPONSE
+
             _LOGGER.debug(
                 "Sending Tuya DP %s for %s via state stream %s",
                 dp_id,
                 dev_id,
                 stream_dev_id,
             )
-            if hasattr(tuya_device, "set_value"):
-                return _call_tinytuya_writer(
-                    tuya_device.set_value,
-                    dp_id,
-                    value,
-                    nowait=True,
-                )
             try:
-                return tuya_device.set_status(value, switch=dp_id, nowait=True)
-            except TypeError:
-                return tuya_device.set_status(value, switch=dp_id)
+                if hasattr(tuya_device, "set_value"):
+                    _call_tinytuya_writer(
+                        tuya_device.set_value,
+                        dp_id,
+                        value,
+                        nowait=True,
+                    )
+                else:
+                    _call_tinytuya_writer(
+                        tuya_device.set_status,
+                        value,
+                        switch=dp_id,
+                        nowait=True,
+                    )
+            except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError, OSError) as write_err:
+                _LOGGER.debug(
+                    "State stream write failed for %s: %s",
+                    stream_dev_id,
+                    write_err,
+                )
+                _close_tinytuya_device(self._stream_tinytuya_devices.pop(stream_dev_id, None))
+                self._last_heartbeat.pop(stream_dev_id, None)
+                self._stream_synced.discard(stream_dev_id)
+                self._keepalive_applied.pop(stream_dev_id, None)
+                self._set_stream_local_connected(stream_dev_id, False)
+                return NO_FALLBACK_RESPONSE
+
+            # Await device ACK or status update on the same stream socket
+            if isinstance(sock, socket.socket):
+                try:
+                    r, _, x = select.select([sock], [], [sock], 0.35)
+                    if x:
+                        raise ConnectionResetError("Socket error in select")
+                    if r:
+                        peek = sock.recv(1, socket.MSG_PEEK)
+                        if not peek:
+                            raise ConnectionResetError("Socket closed by peer during ACK")
+                        if hasattr(stream_device, "_receive") and hasattr(stream_device, "_process_message"):
+                            msg = stream_device._receive()
+                            if msg:
+                                payload = stream_device._process_message(msg)
+                                if isinstance(payload, dict):
+                                    self._handle_state_stream_payload(stream_dev_id, payload)
+                                    return payload
+                except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError, OSError) as err:
+                    _LOGGER.debug(
+                        "State stream connection reset while awaiting ACK for %s: %s",
+                        stream_dev_id,
+                        err,
+                    )
+                    _close_tinytuya_device(self._stream_tinytuya_devices.pop(stream_dev_id, None))
+                    self._last_heartbeat.pop(stream_dev_id, None)
+                    self._stream_synced.discard(stream_dev_id)
+                    self._keepalive_applied.pop(stream_dev_id, None)
+                    self._set_stream_local_connected(stream_dev_id, False)
+                    return NO_FALLBACK_RESPONSE
+                except Exception as err:
+                    err_msg = str(err).lower()
+                    if "connection closed" in err_msg or "closed by peer" in err_msg or "decodeerror" in type(err).__name__.lower():
+                        _close_tinytuya_device(self._stream_tinytuya_devices.pop(stream_dev_id, None))
+                        self._last_heartbeat.pop(stream_dev_id, None)
+                        self._stream_synced.discard(stream_dev_id)
+                        self._keepalive_applied.pop(stream_dev_id, None)
+                        self._set_stream_local_connected(stream_dev_id, False)
+                        return NO_FALLBACK_RESPONSE
+
+            return {"success": True}
 
     def _set_dp_once(self, dev_id: str, dp_id: int, value: Any) -> Any:
         device = self._tinytuya_device(dev_id)
@@ -2389,6 +2452,28 @@ def _is_dp201_ir_action(action: TuyaIrAction) -> bool:
 def _prefer_dp201_ir_actions(actions: list[TuyaIrAction]) -> list[TuyaIrAction]:
     dp201_actions = [action for action in actions if _is_dp201_ir_action(action)]
     return dp201_actions or actions
+
+
+def _is_socket_closed(sock: Any) -> bool:
+    """Return True if a socket is None, closed, or disconnected by remote peer."""
+    if sock is None:
+        return True
+    try:
+        fn = sock.fileno()
+        if isinstance(fn, int) and fn < 0:
+            return True
+        if not isinstance(sock, socket.socket):
+            return False
+        r, _, x = select.select([sock], [], [sock], 0)
+        if x:
+            return True
+        if r:
+            peek = sock.recv(1, socket.MSG_PEEK)
+            if not peek:
+                return True
+    except (OSError, ValueError):
+        return True
+    return False
 
 
 def _call_tinytuya_writer(method: Any, *args: Any, nowait: bool, **kwargs: Any) -> Any:
