@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 from homeassistant.components.switch import SwitchEntity
@@ -54,6 +55,8 @@ class TuyaDpsSwitch(CoordinatorEntity[TuyaSmartLifeCoordinator], SwitchEntity):
         self._state = initial_value
         self._local_ok: bool | None = None
         self._remove_dps_listener: CALLBACK_TYPE | None = None
+        self._target_state: bool | None = None
+        self._target_state_until: float = 0.0
         self._attr_unique_id = f"{device.dev_id}_{self.dp_id}"
         self._attr_name = label
         self._attr_device_info = {
@@ -110,6 +113,19 @@ class TuyaDpsSwitch(CoordinatorEntity[TuyaSmartLifeCoordinator], SwitchEntity):
         value = dps.get(self.dp_id)
         bool_val = _to_bool(value)
         if bool_val is not None:
+            now = time.monotonic()
+            if self._target_state is not None and now < self._target_state_until:
+                if bool_val != self._target_state:
+                    _LOGGER.debug(
+                        "Tuya switch %s ignoring stale DPS update %s while awaiting target state %s",
+                        self.entity_id,
+                        bool_val,
+                        self._target_state,
+                    )
+                    return
+                # Target state reached from device echo
+                self._target_state = None
+                self._target_state_until = 0.0
             self._local_ok = True
             self._state = bool_val
             self.async_write_ha_state()
@@ -134,12 +150,16 @@ class TuyaDpsSwitch(CoordinatorEntity[TuyaSmartLifeCoordinator], SwitchEntity):
             raise RuntimeError(f"Device {self.device.dev_id} is no longer available")
         prev_state = self._state
         self._state = value
+        self._target_state = value
+        self._target_state_until = time.monotonic() + 1.2
         self.async_write_ha_state()
         try:
             response = await self.runtime.local.async_set_dp(device, self.dp_id, value)
             if isinstance(response, dict) and response.get("Error"):
                 self._local_ok = False
                 self._state = prev_state
+                self._target_state = None
+                self._target_state_until = 0.0
                 self._async_write_state_if_added()
                 raise RuntimeError(
                     f"Unable to set Tuya DP {self.dp_id} for {device.dev_id}: "
@@ -149,6 +169,8 @@ class TuyaDpsSwitch(CoordinatorEntity[TuyaSmartLifeCoordinator], SwitchEntity):
             device.dps[self.dp_id] = value
         except Exception:
             self._state = prev_state
+            self._target_state = None
+            self._target_state_until = 0.0
             self._async_write_state_if_added()
             raise
 

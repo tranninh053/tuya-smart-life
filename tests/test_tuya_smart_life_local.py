@@ -13,6 +13,7 @@ Covers:
 import asyncio
 import os
 import sys
+import time
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -699,6 +700,110 @@ class TestCoreDeprecationFix(unittest.TestCase):
 
         self.assertIn("entry_123", legacy_entries)
         self.assertIn("entry_456", modern_entries)
+
+
+class TestRapidToggleCoalescingAndOptimisticLockout(unittest.IsolatedAsyncioTestCase):
+    """Test Suite 6: Verify rapid toggle command coalescing and switch optimistic state lockout."""
+
+    async def asyncSetUp(self):
+        self.hass = MagicMock()
+        self.hass.loop = asyncio.get_running_loop()
+        self.local_runtime = TuyaLocalRuntime(self.hass)
+
+        self.device = make_test_device(
+            dev_id="dev_rapid_001",
+            name="Rapid Light Switch",
+            local_key="key1234567890123",
+            ip="192.168.31.210",
+            protocol_version="3.3",
+            online=True,
+            dps={"1": False},
+        )
+        self.local_runtime.devices[self.device.dev_id] = self.device
+
+        # Mark as active stream so it goes to local fast-path
+        mock_stream = MagicMock()
+        mock_stream.socket = MagicMock()
+        self.local_runtime._stream_tinytuya_devices[self.device.dev_id] = mock_stream
+        self.local_runtime._local_connected[self.device.dev_id] = True
+
+        async def mock_async_add_executor_job(target, *args):
+            await asyncio.sleep(0.01)
+            return target(*args)
+
+        self.hass.async_add_executor_job = mock_async_add_executor_job
+
+    async def test_rapid_toggle_coalescing(self):
+        """When 4 rapid toggles occur in flight, intermediate calls collapse and only 2 sends occur."""
+        send_calls = []
+
+        def mock_set_dp(dev_id, dp_id, value):
+            send_calls.append(value)
+            # Simulate a small socket delay
+            time.sleep(0.02)
+            return {"success": True}
+
+        self.local_runtime._set_dp = mock_set_dp
+
+        # Launch 4 rapid toggles: ON -> OFF -> ON -> OFF concurrently
+        tasks = [
+            asyncio.create_task(self.local_runtime.async_set_dp(self.device, "1", True)),
+            asyncio.create_task(self.local_runtime.async_set_dp(self.device, "1", False)),
+            asyncio.create_task(self.local_runtime.async_set_dp(self.device, "1", True)),
+            asyncio.create_task(self.local_runtime.async_set_dp(self.device, "1", False)),
+        ]
+        results = await asyncio.gather(*tasks)
+
+        # All 4 calls must succeed
+        self.assertEqual(len(results), 4)
+        for res in results:
+            self.assertIsNotNone(res)
+
+        # But only 2 physical network sends should have executed (initial True, then final False)!
+        self.assertLessEqual(len(send_calls), 2, f"Expected at most 2 sends, got {len(send_calls)}: {send_calls}")
+        self.assertEqual(send_calls[-1], False, "Final physical send must match last requested state")
+
+    async def test_switch_optimistic_lockout_ignores_stale_dps(self):
+        """Switch optimistic lockout must drop older opposing state packets while waiting for target."""
+        coordinator = MagicMock()
+        runtime = MagicMock()
+        runtime.local = self.local_runtime
+
+        switch = TuyaDpsSwitch(coordinator, runtime, self.device, "1", False, "Switch 1")
+        switch.entity_id = "switch.rapid_light_1"
+        switch.async_write_ha_state = MagicMock()
+
+        # User turns ON
+        self.local_runtime._set_dp = MagicMock(return_value={"success": True})
+        await switch.async_turn_on()
+        self.assertTrue(switch.is_on)
+        self.assertEqual(switch._target_state, True)
+
+        # A stale 'False' report arrives from an earlier hardware echo
+        switch._handle_dps_update(self.device.dev_id, {"1": False})
+        # Must be ignored: switch remains ON
+        self.assertTrue(switch.is_on, "Switch should ignore stale False report while awaiting True")
+
+        # The genuine 'True' report arrives
+        switch._handle_dps_update(self.device.dev_id, {"1": True})
+        self.assertTrue(switch.is_on)
+        self.assertIsNone(switch._target_state, "Target state should be cleared once achieved")
+
+    def test_make_tinytuya_device_retry_limit_always_nonzero(self):
+        """Verify _make_tinytuya_device configures socketRetryLimit to at least 1 for all connections."""
+        mock_tinytuya = MagicMock()
+        mock_device = MagicMock()
+        mock_tinytuya.OutletDevice.return_value = mock_device
+
+        dev = self.local_runtime._make_tinytuya_device(
+            mock_tinytuya,
+            self.device,
+            "192.168.31.210",
+            "key1234567890123",
+            parent=None,
+            persistent=False,
+        )
+        mock_device.set_socketRetryLimit.assert_called_with(1)
 
 
 if __name__ == "__main__":

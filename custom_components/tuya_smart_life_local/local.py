@@ -269,6 +269,10 @@ class TuyaLocalRuntime:
         self._last_force_scan = 0.0
         self.mqtt_events: dict[str, dict[str, Any]] = {}
         self._keepalive_applied: dict[str, int] = {}  # dev_id -> socket fileno
+        self._dp_in_flight: dict[tuple[str, str], asyncio.Event] = {}
+        self._dp_pending: dict[tuple[str, str], Any] = {}
+        self._dp_last_results: dict[tuple[str, str], Any] = {}
+        self._stream_child_devices: dict[str, Any] = {}
         self.mqtt: Any | None = None
 
     async def async_start(self) -> None:
@@ -343,6 +347,10 @@ class TuyaLocalRuntime:
         self._state_stream_pause_until.clear()
         self._local_connected.clear()
         self._keepalive_applied.clear()
+        self._dp_in_flight.clear()
+        self._dp_pending.clear()
+        self._dp_last_results.clear()
+        self._stream_child_devices.clear()
 
     def _get_stream_lock(self, dev_id: str) -> threading.RLock:
         device = self.devices.get(dev_id)
@@ -515,6 +523,10 @@ class TuyaLocalRuntime:
     def _notify_metadata_listeners(self) -> None:
         for listener in list(self._metadata_callbacks):
             self.hass.loop.call_soon_threadsafe(listener)
+
+    def _notify_state_callbacks(self, dev_id: str, dps: dict[str, Any]) -> None:
+        for listener in list(self._state_callbacks):
+            self.hass.loop.call_soon_threadsafe(listener, dev_id, dps)
 
     def apply_mqtt_dps(
         self,
@@ -1389,12 +1401,65 @@ class TuyaLocalRuntime:
         dp_id: str,
         value: Any,
     ) -> Any:
+        dp_str = str(dp_id)
+        key = (device.dev_id, dp_str)
+        self._dp_pending[key] = value
+
+        if key in self._dp_in_flight:
+            # Another task is currently dispatching to this DP; wait for it to process
+            event = self._dp_in_flight[key]
+            await event.wait()
+            res = self._dp_last_results.get(key)
+            if isinstance(res, Exception):
+                raise res
+            return res if res is not None else {"success": True, "coalesced": True}
+
+        # Become the active dispatcher for this (device, dp)
+        event = asyncio.Event()
+        self._dp_in_flight[key] = event
+        last_sent = object()
+        last_response: Any = None
+        try:
+            while key in self._dp_pending:
+                target_value = self._dp_pending.pop(key)
+                if target_value == last_sent:
+                    break
+
+                try:
+                    last_response = await self._async_send_dp_direct(
+                        device,
+                        dp_str,
+                        target_value,
+                    )
+                    last_sent = target_value
+                    self._dp_last_results[key] = last_response
+                    device.dps[dp_str] = target_value
+                    self._notify_state_callbacks(device.dev_id, {dp_str: target_value})
+                except Exception as err:
+                    self._dp_last_results[key] = err
+                    raise err
+            return last_response
+        finally:
+            self._dp_in_flight.pop(key, None)
+            event.set()
+
+    async def _async_send_dp_direct(
+        self,
+        device: TuyaDeviceDescription,
+        dp_id: str,
+        value: Any,
+    ) -> Any:
         mqtt_client = getattr(self, "mqtt", None)
         has_cloud_mqtt = bool(
             mqtt_client
             and hasattr(mqtt_client, "async_publish_dps")
             and getattr(mqtt_client, "is_connected", False)
         )
+
+        try:
+            dp_num = int(dp_id)
+        except ValueError:
+            dp_num = dp_id
 
         # Fast-path: When device doesn't have an active, ready local TCP socket right now,
         # avoid the blocking local connection timeout and publish directly to Cloud MQTT for instant ~100ms response.
@@ -1422,7 +1487,7 @@ class TuyaLocalRuntime:
                 response = await self.hass.async_add_executor_job(
                     self._set_dp,
                     device.dev_id,
-                    int(dp_id),
+                    dp_num,
                     value,
                 )
         except Exception as err:
@@ -1612,18 +1677,21 @@ class TuyaLocalRuntime:
         if target.dev_id == stream_dev_id:
             tuya_device = stream_device
         else:
-            try:
-                import tinytuya
-            except ImportError:
-                return NO_FALLBACK_RESPONSE
-            tuya_device = self._make_tinytuya_device(
-                tinytuya,
-                target,
-                parent.ip,
-                parent.local_key,
-                stream_device,
-                persistent=True,
-            )
+            tuya_device = self._stream_child_devices.get(dev_id)
+            if not tuya_device:
+                try:
+                    import tinytuya
+                except ImportError:
+                    return NO_FALLBACK_RESPONSE
+                tuya_device = self._make_tinytuya_device(
+                    tinytuya,
+                    target,
+                    parent.ip,
+                    parent.local_key,
+                    stream_device,
+                    persistent=True,
+                )
+                self._stream_child_devices[dev_id] = tuya_device
 
         with self._get_stream_lock(stream_dev_id):
             _LOGGER.debug(
@@ -2123,7 +2191,7 @@ class TuyaLocalRuntime:
         if hasattr(tuya_device, "set_socketNODELAY"):
             tuya_device.set_socketNODELAY(True)
         if hasattr(tuya_device, "set_socketRetryLimit"):
-            tuya_device.set_socketRetryLimit(1 if persistent else 0)
+            tuya_device.set_socketRetryLimit(1)
         if hasattr(tuya_device, "set_socketTimeout"):
             tuya_device.set_socketTimeout(STATE_STREAM_TIMEOUT_SECONDS if persistent else 1.0)
         tuya_device.connection_timeout = 2.0 if persistent else 1.0
