@@ -974,6 +974,28 @@ class TestRapidToggleCoalescingAndOptimisticLockout(unittest.IsolatedAsyncioTest
         self.local_runtime._update_command_local_connection(self.device.dev_id, {"Error": "Write failed"})
         self.assertTrue(self.local_runtime._local_connected.get(self.device.dev_id, False))
 
+    async def test_state_stream_loop_debounces_disconnection_under_60s(self):
+        """Verify _state_stream_loop does not mark disconnected during transient drops under 60s."""
+        self.local_runtime._local_connected[self.device.dev_id] = True
+        call_count = 0
+
+        def fake_receive(dev_id):
+            nonlocal call_count
+            call_count += 1
+            if call_count <= 3:
+                raise ConnectionResetError("Transient socket reset")
+            # Cancel loop by removing device
+            self.local_runtime.devices.pop(dev_id, None)
+            return []
+
+        self.local_runtime._receive_state_stream = fake_receive
+
+        with patch("custom_components.tuya_smart_life_local.local.asyncio.sleep", AsyncMock()):
+            await self.local_runtime._state_stream_loop(self.device.dev_id)
+
+        # Transient 3 failures within 0s elapsed time must NOT mark device as disconnected
+        self.assertTrue(self.local_runtime._local_connected.get(self.device.dev_id, False))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

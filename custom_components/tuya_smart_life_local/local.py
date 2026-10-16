@@ -598,6 +598,7 @@ class TuyaLocalRuntime:
 
     async def _state_stream_loop(self, dev_id: str) -> None:
         consecutive_failures = 0
+        first_failure_time: float | None = None
         while dev_id in self.devices:
             try:
                 pause_for = self._state_stream_pause_remaining(dev_id)
@@ -617,6 +618,7 @@ class TuyaLocalRuntime:
                 )
                 if consecutive_failures > 0:
                     consecutive_failures = 0
+                    first_failure_time = None
                 for payload in payloads:
                     self._handle_state_stream_payload(dev_id, payload)
                 if not payloads:
@@ -625,10 +627,15 @@ class TuyaLocalRuntime:
                 raise
             except Exception as err:
                 consecutive_failures += 1
+                now = time.monotonic()
+                if first_failure_time is None:
+                    first_failure_time = now
+                elapsed = now - first_failure_time
                 _LOGGER.debug(
-                    "Tuya state stream for %s failed (attempts=%s): %s",
+                    "Tuya state stream for %s failed (attempts=%s, elapsed=%.1fs): %s",
                     dev_id,
                     consecutive_failures,
+                    elapsed,
                     err,
                     exc_info=True,
                 )
@@ -636,11 +643,11 @@ class TuyaLocalRuntime:
                 self._last_heartbeat.pop(dev_id, None)
                 self._stream_synced.discard(dev_id)
                 self._keepalive_applied.pop(dev_id, None)
-                if consecutive_failures >= 3:
+                if elapsed >= 60.0:
                     self._set_stream_local_connected(dev_id, False)
-                retry_delay = 1.0 if consecutive_failures == 1 else min(
-                    STATE_STREAM_RECONNECT_SECONDS * (2.0 ** min(consecutive_failures - 2, 4)),
-                    60,
+                retry_delay = 2.0 if consecutive_failures == 1 else min(
+                    STATE_STREAM_RECONNECT_SECONDS * (1.5 ** min(consecutive_failures - 2, 4)),
+                    30.0,
                 )
                 _LOGGER.debug(
                     "Tuya state stream for %s will reconnect in %.1fs",
