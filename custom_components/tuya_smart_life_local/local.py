@@ -702,16 +702,18 @@ class TuyaLocalRuntime:
                     )
 
         sock = getattr(device, "socket", None)
-        if _is_socket_closed(sock):
-            raise ConnectionError(f"Tuya state stream socket for {dev_id} is closed or disconnected")
-
+        if sock is None:
+            raise ConnectionError(f"Tuya state stream socket for {dev_id} is None")
         try:
             fileno = sock.fileno()
+            if isinstance(fileno, int) and fileno < 0:
+                raise ConnectionError(f"Tuya state stream socket for {dev_id} has invalid fileno")
             if self._keepalive_applied.get(dev_id) != fileno:
                 _enable_tcp_keepalive(sock)
                 self._keepalive_applied[dev_id] = fileno
-        except (OSError, ValueError):
-            pass
+        except (OSError, ValueError) as err:
+            raise ConnectionError(f"Tuya state stream socket for {dev_id} is invalid: {err}") from err
+
         try:
             r, _, _ = select.select([sock], [], [], 0.5)
         except (ValueError, OSError):
@@ -720,8 +722,6 @@ class TuyaLocalRuntime:
             return payloads
 
         with lock:
-            if _is_socket_closed(sock):
-                raise ConnectionResetError(f"Tuya state stream socket for {dev_id} closed by peer")
             try:
                 if hasattr(device, "_receive") and hasattr(device, "_process_message"):
                     msg = device._receive()
@@ -1534,10 +1534,14 @@ class TuyaLocalRuntime:
             local_err = err
             _LOGGER.debug("Local set DP failed for %s: %s", device.dev_id, err)
 
-        if not local_err and (not isinstance(response, dict) or not response.get("Error")):
+        if (
+            not local_err
+            and response is not NO_FALLBACK_RESPONSE
+            and (not isinstance(response, dict) or not response.get("Error"))
+        ):
             return response
 
-        # Fallback to Cloud MQTT if local failed or returned error
+        # Fallback to Cloud MQTT if local failed, returned error, or stream needs fallback
         if has_cloud_mqtt:
             try:
                 _LOGGER.info(
@@ -1685,14 +1689,23 @@ class TuyaLocalRuntime:
         if stream_response is not NO_FALLBACK_RESPONSE:
             self._update_command_local_connection(dev_id, stream_response)
             return stream_response
+
+        stream_dev_id = self._command_stream_device_id(dev_id)
+        has_stream = (
+            dev_id in self._state_stream_tasks
+            or (stream_dev_id and stream_dev_id in self._state_stream_tasks)
+        )
+        if has_stream:
+            # If the device is managed by a persistent stream, avoid blocking one-shot
+            # TCP connections (_set_dp_once) that hang 3-5s and collide on port 6668.
+            return NO_FALLBACK_RESPONSE
+
         try:
             response = self._set_dp_once(dev_id, dp_id, value)
         except Exception:
-            if dev_id not in self._state_stream_tasks:
-                self._set_local_connected(dev_id, False)
-                stream_dev_id = self._command_stream_device_id(dev_id)
-                if stream_dev_id and stream_dev_id != dev_id:
-                    self._set_local_connected(stream_dev_id, False)
+            self._set_local_connected(dev_id, False)
+            if stream_dev_id and stream_dev_id != dev_id:
+                self._set_local_connected(stream_dev_id, False)
             raise
         if _is_key_or_version_error(response):
             fallback = self._try_protocol_fallback(dev_id, dp_id, value)
@@ -1720,7 +1733,6 @@ class TuyaLocalRuntime:
             self._last_heartbeat.pop(stream_dev_id, None)
             self._stream_synced.discard(stream_dev_id)
             self._keepalive_applied.pop(stream_dev_id, None)
-            self._set_stream_local_connected(stream_dev_id, False)
             return NO_FALLBACK_RESPONSE
 
         target = self.devices.get(dev_id)
@@ -1753,7 +1765,6 @@ class TuyaLocalRuntime:
                 self._last_heartbeat.pop(stream_dev_id, None)
                 self._stream_synced.discard(stream_dev_id)
                 self._keepalive_applied.pop(stream_dev_id, None)
-                self._set_stream_local_connected(stream_dev_id, False)
                 return NO_FALLBACK_RESPONSE
 
             _LOGGER.debug(
@@ -1787,7 +1798,6 @@ class TuyaLocalRuntime:
                 self._last_heartbeat.pop(stream_dev_id, None)
                 self._stream_synced.discard(stream_dev_id)
                 self._keepalive_applied.pop(stream_dev_id, None)
-                self._set_stream_local_connected(stream_dev_id, False)
                 return NO_FALLBACK_RESPONSE
 
             # Await device ACK or status update on the same stream socket
@@ -1817,7 +1827,6 @@ class TuyaLocalRuntime:
                     self._last_heartbeat.pop(stream_dev_id, None)
                     self._stream_synced.discard(stream_dev_id)
                     self._keepalive_applied.pop(stream_dev_id, None)
-                    self._set_stream_local_connected(stream_dev_id, False)
                     return NO_FALLBACK_RESPONSE
                 except Exception as err:
                     err_msg = str(err).lower()
@@ -1826,7 +1835,6 @@ class TuyaLocalRuntime:
                         self._last_heartbeat.pop(stream_dev_id, None)
                         self._stream_synced.discard(stream_dev_id)
                         self._keepalive_applied.pop(stream_dev_id, None)
-                        self._set_stream_local_connected(stream_dev_id, False)
                         return NO_FALLBACK_RESPONSE
 
             return {"success": True}
@@ -2069,8 +2077,15 @@ class TuyaLocalRuntime:
 
     def _update_command_local_connection(self, dev_id: str, response: Any) -> None:
         connected = not _response_has_error(response)
-        self._set_local_connected(dev_id, connected)
         stream_dev_id = self._command_stream_device_id(dev_id)
+        has_stream = (
+            dev_id in self._state_stream_tasks
+            or (stream_dev_id and stream_dev_id in self._state_stream_tasks)
+        )
+        if not connected and has_stream:
+            # Let the persistent state stream loop handle disconnection debouncing
+            return
+        self._set_local_connected(dev_id, connected)
         if stream_dev_id and stream_dev_id != dev_id:
             self._set_local_connected(stream_dev_id, connected)
 

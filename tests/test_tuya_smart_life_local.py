@@ -909,7 +909,7 @@ class TestRapidToggleCoalescingAndOptimisticLockout(unittest.IsolatedAsyncioTest
                 self.local_runtime._receive_state_stream(self.device.dev_id)
 
     def test_set_dp_via_state_stream_cleans_up_and_fails_over_on_peer_close(self):
-        """Verify _set_dp_via_state_stream detects dead socket, purges stream, and returns NO_FALLBACK_RESPONSE."""
+        """Verify _set_dp_via_state_stream detects dead socket, purges stream, and returns NO_FALLBACK_RESPONSE without false disconnect."""
         import socket
         from custom_components.tuya_smart_life_local.local import NO_FALLBACK_RESPONSE
 
@@ -926,10 +926,56 @@ class TestRapidToggleCoalescingAndOptimisticLockout(unittest.IsolatedAsyncioTest
             res = self.local_runtime._set_dp_via_state_stream(self.device.dev_id, 1, True)
             self.assertIs(res, NO_FALLBACK_RESPONSE)
             self.assertNotIn(self.device.dev_id, self.local_runtime._stream_tinytuya_devices)
+            # Crucial: Must NOT flip local connected to False on transient command socket teardown
+            self.assertTrue(self.local_runtime._local_connected.get(self.device.dev_id, False))
         finally:
             s1.close()
+
+    def test_set_dp_stream_fallback_skips_set_dp_once(self):
+        """Verify _set_dp immediately returns NO_FALLBACK_RESPONSE for streaming devices without calling _set_dp_once."""
+        from custom_components.tuya_smart_life_local.local import NO_FALLBACK_RESPONSE
+
+        self.local_runtime._state_stream_tasks[self.device.dev_id] = MagicMock()
+        self.local_runtime._set_dp_via_state_stream = MagicMock(return_value=NO_FALLBACK_RESPONSE)
+        self.local_runtime._set_dp_once = MagicMock()
+
+        res = self.local_runtime._set_dp(self.device.dev_id, 1, True)
+        self.assertIs(res, NO_FALLBACK_RESPONSE)
+        self.local_runtime._set_dp_once.assert_not_called()
+
+    def test_async_send_dp_direct_falls_back_to_cloud_mqtt_on_no_fallback_response(self):
+        """Verify _async_send_dp_direct triggers Cloud MQTT fallback when local returns NO_FALLBACK_RESPONSE."""
+        import asyncio
+        from custom_components.tuya_smart_life_local.local import NO_FALLBACK_RESPONSE
+
+        mock_mqtt = MagicMock()
+        mock_mqtt.is_connected = True
+        mock_mqtt.async_publish_dps = AsyncMock()
+        self.local_runtime.mqtt = mock_mqtt
+
+        self.local_runtime.has_active_local_stream = MagicMock(return_value=True)
+        self.local_runtime._set_dp = MagicMock(return_value=NO_FALLBACK_RESPONSE)
+
+        loop = asyncio.new_event_loop()
+        try:
+            res = loop.run_until_complete(
+                self.local_runtime._async_send_dp_direct(self.device, "1", True)
+            )
+            self.assertEqual(res, {"success": True, "fallback": "cloud_mqtt"})
+            mock_mqtt.async_publish_dps.assert_awaited_once_with(self.device, {"1": True})
+        finally:
+            loop.close()
+
+    def test_update_command_local_connection_does_not_disconnect_streaming_device(self):
+        """Verify _update_command_local_connection avoids marking streaming devices as disconnected on error."""
+        self.local_runtime._state_stream_tasks[self.device.dev_id] = MagicMock()
+        self.local_runtime._local_connected[self.device.dev_id] = True
+
+        self.local_runtime._update_command_local_connection(self.device.dev_id, {"Error": "Write failed"})
+        self.assertTrue(self.local_runtime._local_connected.get(self.device.dev_id, False))
 
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
 
