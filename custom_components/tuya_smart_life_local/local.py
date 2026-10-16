@@ -26,7 +26,7 @@ DISCOVERY_PORTS = (6666, 6667, 6699, 7000)
 DISCOVERY_SCAN_SECONDS = 8
 FORCE_SCAN_INTERVAL_SECONDS = 900
 STATE_STREAM_TIMEOUT_SECONDS = 10
-STATE_STREAM_RECONNECT_SECONDS = 5.0
+STATE_STREAM_RECONNECT_SECONDS = 2.0
 STATE_STREAM_HEARTBEAT_SECONDS = 20
 STATE_STREAM_REFRESH_DP_IDS = [4, 5, 6, 18, 19, 20]
 LOCAL_CACHE_VERSION = 1
@@ -1221,6 +1221,18 @@ class TuyaLocalRuntime:
             return self._local_connected.get(parent.dev_id if parent else "") is True
         return self._local_connected.get(device.dev_id) is True
 
+    def has_active_local_stream(self, device: TuyaDeviceDescription | None) -> bool:
+        if not device:
+            return False
+        stream_dev_id = self._command_stream_device_id(device.dev_id)
+        if not stream_dev_id:
+            return False
+        stream_device = self._stream_tinytuya_devices.get(stream_dev_id)
+        if not stream_device:
+            return False
+        sock = getattr(stream_device, "socket", None)
+        return sock is not None
+
     def has_ir_local_connection(self, remote_id: str, hub_dev_id: str) -> bool:
         remote = self.devices.get(remote_id)
         hub = self.devices.get(hub_dev_id)
@@ -1384,12 +1396,12 @@ class TuyaLocalRuntime:
             and getattr(mqtt_client, "is_connected", False)
         )
 
-        # Fast-path: When device is known to be offline locally, avoid the blocking
-        # local connection timeout and publish directly to Cloud MQTT for instant ~100ms response.
-        if not self.has_local_connection(device) and has_cloud_mqtt:
+        # Fast-path: When device doesn't have an active, ready local TCP socket right now,
+        # avoid the blocking local connection timeout and publish directly to Cloud MQTT for instant ~100ms response.
+        if not self.has_active_local_stream(device) and has_cloud_mqtt:
             try:
                 _LOGGER.debug(
-                    "Device %s is offline locally; routing DP %s=%s directly via Cloud MQTT",
+                    "Device %s has no active local stream; routing DP %s=%s directly via Cloud MQTT",
                     device.dev_id,
                     dp_id,
                     value,
@@ -2114,6 +2126,7 @@ class TuyaLocalRuntime:
             tuya_device.set_socketRetryLimit(1 if persistent else 0)
         if hasattr(tuya_device, "set_socketTimeout"):
             tuya_device.set_socketTimeout(STATE_STREAM_TIMEOUT_SECONDS if persistent else 1.0)
+        tuya_device.connection_timeout = 2.0 if persistent else 1.0
         return tuya_device
 
 

@@ -523,7 +523,9 @@ class TestCommandExecutionAndCloudFallback(unittest.IsolatedAsyncioTestCase):
         self.mock_mqtt.is_connected = True
         self.mock_mqtt.async_publish_dps = AsyncMock(return_value=None)
         self.local_runtime.mqtt = self.mock_mqtt
-
+        mock_stream_dev = MagicMock()
+        mock_stream_dev.socket = MagicMock()
+        self.local_runtime._stream_tinytuya_devices[self.device.dev_id] = mock_stream_dev
         self.local_runtime._local_connected[self.device.dev_id] = True
 
         async def mock_async_add_executor_job(target, *args):
@@ -544,6 +546,7 @@ class TestCommandExecutionAndCloudFallback(unittest.IsolatedAsyncioTestCase):
 
     async def test_async_set_dp_fast_path_when_local_offline(self):
         """When device is disconnected locally, it directly fast-paths to Cloud MQTT without blocking."""
+        self.local_runtime._stream_tinytuya_devices.clear()
         self.local_runtime._local_connected[self.device.dev_id] = False
         self.local_runtime._set_dp = MagicMock()
 
