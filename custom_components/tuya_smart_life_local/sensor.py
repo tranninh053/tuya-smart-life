@@ -140,7 +140,10 @@ class TuyaContextButtonSensor(
 
     @property
     def available(self) -> bool:
-        return self.runtime.local.has_local_connection(self.current_device)
+        device = self.current_device
+        if not device:
+            return False
+        return self.runtime.local.has_local_connection(device) or bool(device.online)
 
     @property
     def native_value(self) -> str | None:
@@ -228,7 +231,10 @@ class TuyaDpsSensor(
 
     @property
     def available(self) -> bool:
-        return self.runtime.local.has_local_connection(self.current_device)
+        device = self.current_device
+        if not device:
+            return False
+        return self.runtime.local.has_local_connection(device) or bool(device.online)
 
     @property
     def native_value(self) -> float:

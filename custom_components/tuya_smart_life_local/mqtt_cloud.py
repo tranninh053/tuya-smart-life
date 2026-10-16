@@ -94,6 +94,10 @@ class TuyaMqttCloudRuntime:
         self._subscribed: set[str] = set()
         self._remove_metadata_listener: Callable[[], None] | None = None
 
+    @property
+    def is_connected(self) -> bool:
+        return self._connected.is_set()
+
     async def async_start(self) -> None:
         if not self.config:
             _LOGGER.debug("Tuya cloud MQTT missing credentials")

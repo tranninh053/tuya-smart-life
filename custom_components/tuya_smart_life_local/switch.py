@@ -81,7 +81,7 @@ class TuyaDpsSwitch(CoordinatorEntity[TuyaSmartLifeCoordinator], SwitchEntity):
         device = self.current_device
         if not device:
             return False
-        return self.runtime.local.has_local_connection(device)
+        return self.runtime.local.has_local_connection(device) or bool(device.online)
 
     async def async_added_to_hass(self) -> None:
         self._remove_dps_listener = self.runtime.local.async_add_dps_listener(

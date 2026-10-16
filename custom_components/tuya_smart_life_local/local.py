@@ -269,6 +269,7 @@ class TuyaLocalRuntime:
         self._last_force_scan = 0.0
         self.mqtt_events: dict[str, dict[str, Any]] = {}
         self._keepalive_applied: dict[str, int] = {}  # dev_id -> socket fileno
+        self.mqtt: Any | None = None
 
     async def async_start(self) -> None:
         if self.transports:
@@ -448,9 +449,9 @@ class TuyaLocalRuntime:
                 device.protocol_version = IR_HUB_DEFAULT_PROTOCOL_VERSION
             old = existing.get(device.dev_id)
             if old:
-                if _is_lan_ip(old.ip) and old.ip != device.ip:
+                if _is_lan_ip(old.ip) and not _is_lan_ip(device.ip):
                     device.ip = old.ip
-                if old.protocol_version:
+                if old.protocol_version and not device.protocol_version:
                     device.protocol_version = old.protocol_version
                 for field in fields(TuyaDeviceDescription):
                     setattr(old, field.name, getattr(device, field.name))
@@ -1373,13 +1374,49 @@ class TuyaLocalRuntime:
         dp_id: str,
         value: Any,
     ) -> Any:
-        async with self._device_lock(device.dev_id):
-            return await self.hass.async_add_executor_job(
-                self._set_dp,
-                device.dev_id,
-                int(dp_id),
-                value,
-            )
+        response: Any = None
+        local_err: Exception | None = None
+        try:
+            async with self._device_lock(device.dev_id):
+                response = await self.hass.async_add_executor_job(
+                    self._set_dp,
+                    device.dev_id,
+                    int(dp_id),
+                    value,
+                )
+        except Exception as err:
+            local_err = err
+            _LOGGER.debug("Local set DP failed for %s: %s", device.dev_id, err)
+
+        if not local_err and (not isinstance(response, dict) or not response.get("Error")):
+            return response
+
+        # Fallback to Cloud MQTT if local failed or returned error
+        mqtt_client = getattr(self, "mqtt", None)
+        if (
+            mqtt_client
+            and hasattr(mqtt_client, "async_publish_dps")
+            and getattr(mqtt_client, "is_connected", False)
+        ):
+            try:
+                _LOGGER.info(
+                    "Local set DP failed for %s (response=%s, err=%s); falling back to Cloud MQTT",
+                    device.dev_id,
+                    response,
+                    local_err,
+                )
+                await mqtt_client.async_publish_dps(device, {str(dp_id): value})
+                return {"success": True, "fallback": "cloud_mqtt"}
+            except Exception as cloud_err:
+                _LOGGER.warning(
+                    "Cloud MQTT fallback also failed for %s: %s",
+                    device.dev_id,
+                    cloud_err,
+                )
+
+        if local_err:
+            raise local_err
+        return response
 
     async def async_publish_ir_action(self, action: TuyaIrAction) -> Any:
         async with self._device_lock(action.hub_dev_id):
@@ -1478,7 +1515,7 @@ class TuyaLocalRuntime:
             self._set_local_connected(dev_id, False)
             raise
         if _is_key_or_version_error(response):
-            fallback = self._try_child_protocol_fallback(dev_id, None, None)
+            fallback = self._try_protocol_fallback(dev_id, None, None)
             if fallback is not NO_FALLBACK_RESPONSE:
                 response = fallback
         if isinstance(response, dict):
@@ -1516,7 +1553,7 @@ class TuyaLocalRuntime:
                 self._set_local_connected(stream_dev_id, False)
             raise
         if _is_key_or_version_error(response):
-            fallback = self._try_child_protocol_fallback(dev_id, dp_id, value)
+            fallback = self._try_protocol_fallback(dev_id, dp_id, value)
             if fallback is not NO_FALLBACK_RESPONSE:
                 self._update_command_local_connection(dev_id, fallback)
                 return fallback
@@ -1822,6 +1859,49 @@ class TuyaLocalRuntime:
         target_dev_id = self._ir_publish_target_dev_id(action)
         self._set_local_connected(action.hub_dev_id, connected)
         self._set_local_connected(target_dev_id, connected)
+
+    def _try_protocol_fallback(
+        self,
+        dev_id: str,
+        dp_id: int | None,
+        value: Any,
+    ) -> Any:
+        device = self.devices.get(dev_id)
+        if not device:
+            return NO_FALLBACK_RESPONSE
+        if device.is_child:
+            return self._try_child_protocol_fallback(dev_id, dp_id, value)
+        if not device.ip or not device.local_key:
+            return NO_FALLBACK_RESPONSE
+
+        original_version = device.protocol_version
+        candidates = [v for v in ("3.3", "3.4", "3.5") if v != original_version]
+        last_response: Any = None
+        for version in candidates:
+            device.protocol_version = version
+            self._tinytuya_devices.pop(dev_id, None)
+            try:
+                response = (
+                    self._status_once(dev_id)
+                    if dp_id is None
+                    else self._set_dp_once(dev_id, dp_id, value)
+                )
+                last_response = response
+            except Exception:
+                continue
+            if not _is_key_or_version_error(response) and not _response_has_error(response):
+                _LOGGER.info(
+                    "Tuya device %s protocol fallback succeeded: %s -> %s",
+                    dev_id,
+                    original_version,
+                    version,
+                )
+                self._save_local_cache()
+                return response
+
+        device.protocol_version = original_version
+        self._tinytuya_devices.pop(dev_id, None)
+        return last_response if last_response is not None else NO_FALLBACK_RESPONSE
 
     def _try_child_protocol_fallback(
         self,

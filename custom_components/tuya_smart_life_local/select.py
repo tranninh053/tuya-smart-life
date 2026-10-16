@@ -77,7 +77,10 @@ class TuyaChildLockSelect(
 
     @property
     def available(self) -> bool:
-        return self.runtime.local.has_local_connection(self.current_device)
+        device = self.current_device
+        if not device:
+            return False
+        return self.runtime.local.has_local_connection(device) or bool(device.online)
 
     @property
     def current_option(self) -> str | None:

@@ -86,6 +86,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         ),
     )
     await mqtt_runtime.async_start()
+    local_runtime.mqtt = mqtt_runtime
 
     _ensure_hub_registry_entries(hass, entry, local_runtime)
     _remove_stale_registry_entries(hass, entry, local_runtime)
@@ -745,7 +746,8 @@ def _remove_stale_registry_entries(
     if not callable(remove_device):
         return
     for device in list(device_registry.devices.values()):
-        if entry.entry_id not in device.config_entries:
+        device_entries = getattr(device, "config_entries", None) or {getattr(device, "config_entry_id", None)}
+        if entry.entry_id not in device_entries:
             continue
         tuya_ids = {
             identifier
