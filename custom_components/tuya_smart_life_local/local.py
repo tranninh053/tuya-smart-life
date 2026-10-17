@@ -27,7 +27,7 @@ DISCOVERY_SCAN_SECONDS = 8
 FORCE_SCAN_INTERVAL_SECONDS = 900
 STATE_STREAM_TIMEOUT_SECONDS = 2.0
 STATE_STREAM_RECONNECT_SECONDS = 2.0
-STATE_STREAM_HEARTBEAT_SECONDS = 20
+STATE_STREAM_HEARTBEAT_SECONDS = 7
 STATE_STREAM_REFRESH_DP_IDS = [4, 5, 6, 18, 19, 20]
 LOCAL_CACHE_VERSION = 1
 LOCAL_CACHE_KEY = "tuya_smart_life_local.local_cache"
@@ -622,7 +622,7 @@ class TuyaLocalRuntime:
                 for payload in payloads:
                     self._handle_state_stream_payload(dev_id, payload)
                 if not payloads:
-                    await asyncio.sleep(0.25)
+                    await asyncio.sleep(0.05)
             except asyncio.CancelledError:
                 raise
             except Exception as err:
@@ -645,7 +645,7 @@ class TuyaLocalRuntime:
                 self._keepalive_applied.pop(dev_id, None)
                 if elapsed >= 60.0:
                     self._set_stream_local_connected(dev_id, False)
-                retry_delay = 2.0 if consecutive_failures == 1 else min(
+                retry_delay = 2.5 if consecutive_failures == 1 else min(
                     STATE_STREAM_RECONNECT_SECONDS * (1.5 ** min(consecutive_failures - 2, 4)),
                     30.0,
                 )
@@ -679,6 +679,7 @@ class TuyaLocalRuntime:
                         sock_alive = False
                 if sock_alive:
                     self._stream_synced.add(dev_id)
+                    self._last_heartbeat[dev_id] = time.monotonic()
                     if sync_payloads:
                         self._set_stream_local_connected(dev_id, True)
                         payloads.extend(sync_payloads)
@@ -721,51 +722,57 @@ class TuyaLocalRuntime:
         except (OSError, ValueError) as err:
             raise ConnectionError(f"Tuya state stream socket for {dev_id} is invalid: {err}") from err
 
-        try:
-            r, _, _ = select.select([sock], [], [], 0.5)
-        except (ValueError, OSError):
-            r = [sock]
-        if not r:
-            return payloads
-
-        with lock:
+        has_read = False
+        while True:
             try:
-                if hasattr(device, "_receive") and hasattr(device, "_process_message"):
-                    msg = device._receive()
-                    payload = device._process_message(msg) if msg else None
+                timeout = 0.0 if has_read else 0.5
+                r, _, _ = select.select([sock], [], [], timeout)
+            except (ValueError, OSError):
+                r = [sock] if not has_read else []
+            if not r:
+                break
+
+            has_read = True
+            with lock:
+                try:
+                    if hasattr(device, "_receive") and hasattr(device, "_process_message"):
+                        msg = device._receive()
+                        payload = device._process_message(msg) if msg else None
+                    else:
+                        payload = device.receive()
+                except (TimeoutError, socket.timeout):
+                    break
+                except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError, OSError) as err:
+                    _LOGGER.debug("Tuya socket disconnected for %s: %s", dev_id, err)
+                    raise
+                except Exception as err:
+                    err_msg = str(err).lower()
+                    if "connection closed" in err_msg or "closed by peer" in err_msg or "decodeerror" in type(err).__name__.lower():
+                        _LOGGER.debug("Tuya state stream socket closed (%s): %s", dev_id, err)
+                        raise ConnectionResetError(f"Tuya socket closed for {dev_id}: {err}") from err
+                    _LOGGER.debug("Tuya device receive error for %s: %s", dev_id, err)
+                    break
+
+            if getattr(device, "socket", None) is None:
+                raise ConnectionResetError(f"Tuya state stream socket for {dev_id} closed by peer")
+
+            if isinstance(payload, dict):
+                if not _response_has_error(payload):
+                    self._set_local_connected(dev_id, True)
+                    _LOGGER.debug(
+                        "Tuya state stream %s received %s",
+                        dev_id,
+                        _state_stream_payload_summary(payload),
+                    )
+                    payloads.append(payload)
                 else:
-                    payload = device.receive()
-            except (TimeoutError, socket.timeout):
-                return payloads
-            except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError, OSError) as err:
-                _LOGGER.debug("Tuya socket disconnected for %s: %s", dev_id, err)
-                raise
-            except Exception as err:
-                err_msg = str(err).lower()
-                if "connection closed" in err_msg or "closed by peer" in err_msg or "decodeerror" in type(err).__name__.lower():
-                    _LOGGER.debug("Tuya state stream socket closed (%s): %s", dev_id, err)
-                    raise ConnectionResetError(f"Tuya socket closed for {dev_id}: {err}") from err
-                _LOGGER.debug("Tuya device receive error for %s: %s", dev_id, err)
-                return payloads
-
-        if getattr(device, "socket", None) is None:
-            raise ConnectionResetError(f"Tuya state stream socket for {dev_id} closed by peer")
-
-        if isinstance(payload, dict):
-            if not _response_has_error(payload):
-                self._set_local_connected(dev_id, True)
-                _LOGGER.debug(
-                    "Tuya state stream %s received %s",
-                    dev_id,
-                    _state_stream_payload_summary(payload),
-                )
-                payloads.append(payload)
-            else:
-                _LOGGER.debug(
-                    "Tuya state stream %s received error response: %s",
-                    dev_id,
-                    _state_stream_payload_summary(payload),
-                )
+                    _LOGGER.debug(
+                        "Tuya state stream %s received error response: %s",
+                        dev_id,
+                        _state_stream_payload_summary(payload),
+                    )
+            if len(payloads) >= 10:
+                break
         return payloads
 
     def _sync_state_stream(self, dev_id: str, stream_device: Any) -> list[dict[str, Any]]:

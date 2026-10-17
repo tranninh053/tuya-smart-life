@@ -996,8 +996,51 @@ class TestRapidToggleCoalescingAndOptimisticLockout(unittest.IsolatedAsyncioTest
         # Transient 3 failures within 0s elapsed time must NOT mark device as disconnected
         self.assertTrue(self.local_runtime._local_connected.get(self.device.dev_id, False))
 
+    def test_stream_heartbeat_interval_is_7_seconds(self):
+        """Verify STATE_STREAM_HEARTBEAT_SECONDS is set to 7s to prevent Tuya 10s idle socket drop."""
+        from custom_components.tuya_smart_life_local.local import STATE_STREAM_HEARTBEAT_SECONDS
+        self.assertEqual(STATE_STREAM_HEARTBEAT_SECONDS, 7)
+
+    def test_receive_state_stream_drains_heartbeat_ack_and_subsequent_status_payload(self):
+        """Verify _receive_state_stream drains multiple queued frames in one call."""
+        mock_tinytuya_dev = MagicMock()
+        mock_sock = MagicMock()
+        mock_sock.fileno.return_value = 15
+        mock_tinytuya_dev.socket = mock_sock
+
+        # First frame is heartbeat ACK (None payload), second frame is physical button push (DPS update)
+        mock_tinytuya_dev._receive.side_effect = ["raw_heartbeat_ack", "raw_status_push"]
+        mock_tinytuya_dev._process_message.side_effect = [None, {"dps": {"1": True}}]
+
+        self.local_runtime._stream_tinytuya_devices[self.device.dev_id] = mock_tinytuya_dev
+        self.local_runtime._stream_synced.add(self.device.dev_id)
+        self.local_runtime._last_heartbeat[self.device.dev_id] = 1000000000.0  # suppress sending heartbeat during test
+
+        select_calls = 0
+
+        def fake_select(rlist, wlist, xlist, timeout):
+            nonlocal select_calls
+            select_calls += 1
+            if select_calls == 1:
+                self.assertEqual(timeout, 0.5)
+                return ([mock_sock], [], [])
+            elif select_calls == 2:
+                self.assertEqual(timeout, 0.0)
+                return ([mock_sock], [], [])
+            else:
+                self.assertEqual(timeout, 0.0)
+                return ([], [], [])
+
+        with patch("custom_components.tuya_smart_life_local.local.select.select", side_effect=fake_select):
+            payloads = self.local_runtime._receive_state_stream(self.device.dev_id)
+
+        self.assertEqual(len(payloads), 1)
+        self.assertEqual(payloads[0], {"dps": {"1": True}})
+        self.assertTrue(self.local_runtime._local_connected.get(self.device.dev_id, False))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
 
 
